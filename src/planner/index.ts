@@ -6,6 +6,10 @@ export interface Goal {
   title: string;
   reason: string;
   messageId: string;
+  /** Transport the action targets (e.g. 'gmail', 'calendar'). */
+  transport?: string;
+  /** Action class (e.g. 'archive', 'send', 'delete'). */
+  action?: string;
 }
 
 /**
@@ -23,6 +27,8 @@ export function planGoal(message: RedactedMessage): Goal {
     title: `Review message from ${message.fromDomain}`,
     reason: `Subject: ${message.subject}`,
     messageId: message.id,
+    transport: 'gmail',
+    action: 'archive',
   };
 }
 

@@ -1,8 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { FakeGmail, type GmailMessage } from '../gmail/fake.js';
-import { redact, type RedactedMessage } from '../redactor.js';
+import { redact, applyRedactionRules, type RedactedMessage } from '../redactor.js';
 import type { Goal } from '../planner/index.js';
 import { appendJournal } from '../journal.js';
+import { checkBlacklist } from '../principlesGate.js';
+import type { Rules } from '../rules.js';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -11,6 +13,8 @@ export interface ServerDeps {
   journalPath: string;
   /** Injected so tests can avoid spawning a subprocess. */
   plan: (msg: RedactedMessage) => Promise<Goal>;
+  /** Returns current rules; may be updated by file watcher. */
+  getRules: () => Rules;
 }
 
 interface CardState {
@@ -52,7 +56,8 @@ export function createExecutorServer(deps: ServerDeps): Server {
     if (current) return;
     const message = deps.gmail.readOneUnread();
     if (!message) return;
-    const redacted = redact(message);
+    const base = redact(message);
+    const redacted = applyRedactionRules(base, deps.getRules().redaction);
     const goal = await deps.plan(redacted);
     current = { goal, message };
   }
@@ -100,6 +105,25 @@ export function createExecutorServer(deps: ServerDeps): Server {
         if (decision !== 'approve' && decision !== 'reject' && decision !== 'defer') {
           send(res, 400, JSON.stringify({ error: 'bad decision' }));
           return;
+        }
+        // Enforce blacklist before dispatching an approved action
+        if (decision === 'approve' && current.goal.transport && current.goal.action) {
+          const gate = checkBlacklist(
+            deps.getRules().blacklist,
+            current.goal.transport,
+            current.goal.action,
+          );
+          if (!gate.allowed) {
+            appendJournal(deps.journalPath, {
+              kind: 'blocked',
+              goalId: current.goal.id,
+              messageId: current.message.id,
+              reason: gate.reason,
+            });
+            current = null;
+            send(res, 403, JSON.stringify({ error: 'blocked', reason: gate.reason }));
+            return;
+          }
         }
         appendJournal(deps.journalPath, {
           kind: 'decision',

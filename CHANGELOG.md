@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-04-09
+
+### Slice 003 — rules files, principles gate, redactor pipeline
+- Rules loader (`src/rules.ts`) parses `principles.md` as YAML, extracting blacklist entries and redaction rules. Watches the directory for file changes and reloads automatically.
+- Principles gate (`src/principlesGate.ts`) enforces a `(transport, action_class)` blacklist before dispatching any approved action. Blocked actions return 403 and are journalled as `kind: blocked`.
+- Redactor enhanced with `applyRedactionRules`: field-level drops and regex-pattern replacement on top of the existing hard-coded body stripping.
+- Goal now carries optional `transport` and `action` fields so the blacklist can be checked at dispatch time.
+- Executor entry point loads rules from disk at startup and watches for live reloads.
+- 24 tests across 5 files covering all three layers with synthetic rules.
+
 ## 2026-04-08
 
 ### Dev infrastructure

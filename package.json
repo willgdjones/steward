@@ -15,5 +15,8 @@
     "tsx": "^4.7.0",
     "typescript": "^5.4.0",
     "vitest": "^1.4.0"
+  },
+  "dependencies": {
+    "yaml": "^2.8.3"
   }
 }
