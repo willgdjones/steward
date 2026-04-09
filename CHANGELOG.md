@@ -2,6 +2,13 @@
 
 ## 2026-04-09
 
+### Slice 009 — rule promotion meta-cards
+- Pattern detector scans the decision journal for repeated swipe patterns (e.g. "user approved 5 archives from substack.com") and proposes standing rules via meta-cards.
+- `src/promoter.ts` (NEW): `detectPromotions()` groups `kind: 'action'` journal entries by (transport, action, senderDomain). When count >= threshold, returns `Promotion[]` with proposed rule text. Respects cooldowns after rejection and skips already-promoted patterns.
+- `src/rules.ts`: added `PromotionConfig` type with `threshold` (default 5), `cooldown_minutes` (default 1440/24h), `interval_minutes` (default 120). Parsed from `principles.md` YAML.
+- `src/executor/server.ts`: promoter cron runs on configurable interval. `POST /promoter/run` for manual trigger. Promotions become meta-cards in the queue. Approving writes the rule to `gmail.md` and journals `kind: 'rule_promoted'`. Rejecting journals `kind: 'promotion_rejected'` with cooldown enforcement.
+- 95 tests across 11 files; 13 new tests covering pattern detection, threshold, cooldown, dedup, approval writing to gmail.md, rejection cooldown, and config parsing.
+
 ### Slice 008 — post-hoc verifier meta-cards
 - Post-hoc verifier detects anomalies in recently executed actions: user-unarchive (message archived by agent but unarchived by user) and reply-after-archive (new unread message from same sender with matching subject).
 - `src/verifier.ts` (NEW): `detectAnomalies()` reads the journal for `kind: 'action'` entries, checks Gmail state for each archived message, returns typed `Anomaly[]`. Deduplicates via `kind: 'verifier_anomaly'` journal entries.

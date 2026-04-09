@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { FakeGmail, type GmailMessage } from '../gmail/fake.js';
 import { redact, applyRedactionRules, type RedactedMessage } from '../redactor.js';
 import type { Goal, PlannerInput } from '../planner/index.js';
@@ -12,6 +14,7 @@ import { createGmailSubAgent, type GmailSubAgent } from '../gmail/subagent.js';
 import { clusterCandidates, type TriagedCandidate } from '../batcher.js';
 import { detectAnomalies } from '../verifier.js';
 import { readJournal } from '../journal.js';
+import { detectPromotions } from '../promoter.js';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -26,6 +29,8 @@ export interface ServerDeps {
   getRules: () => Rules;
   /** Gmail search query. Defaults to 'is:unread'. */
   searchQuery?: string;
+  /** Directory containing rules files (principles.md, gmail.md). Needed for rule promotion writes. */
+  rulesDir?: string;
 }
 
 interface CardState {
@@ -118,6 +123,45 @@ export function createExecutorServer(deps: ServerDeps): Server {
 
   function stopVerifierCron(): void {
     if (verifierTimer) { clearInterval(verifierTimer); verifierTimer = null; }
+  }
+
+  let promoterTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Run the rule promoter: detect patterns and insert meta-cards. */
+  async function runPromoter(): Promise<void> {
+    const rules = deps.getRules();
+    const promotions = detectPromotions(deps.journalPath, rules.promotion);
+    for (const p of promotions) {
+      const metaId = `meta-promote-${p.patternKey}`;
+      if (metaCardGoalIds.has(metaId)) continue;
+      if (queue.some((c) => c.goal.id === metaId)) continue;
+
+      const metaGoal: Goal = {
+        id: metaId,
+        title: `Promote rule: auto-${p.action} *@${p.senderDomain}`,
+        reason: `You have approved ${p.count} ${p.action} actions from ${p.senderDomain}. Promote to a standing rule?`,
+        messageId: '',
+      };
+      // Attach promotion data for the approval handler
+      (metaGoal as unknown as Record<string, unknown>).promotionData = p;
+      const metaCard: CardState = {
+        goal: metaGoal,
+        message: { id: '', from: `*@${p.senderDomain}`, subject: `Rule promotion: ${p.action} ${p.senderDomain}`, body: '', unread: false },
+        features: { deadline: null, amount: null, waiting_on_user: false, category: 'meta', urgency: 'medium' as const },
+      };
+      queue.push(metaCard);
+      metaCardGoalIds.add(metaId);
+    }
+  }
+
+  function startPromoterCron(): void {
+    const intervalMs = deps.getRules().promotion.interval_minutes * 60 * 1000;
+    if (promoterTimer) clearInterval(promoterTimer);
+    promoterTimer = setInterval(() => { runPromoter().catch(() => {}); }, intervalMs);
+  }
+
+  function stopPromoterCron(): void {
+    if (promoterTimer) { clearInterval(promoterTimer); promoterTimer = null; }
   }
 
   async function triageAndPlan(message: GmailMessage): Promise<CardState> {
@@ -426,6 +470,40 @@ export function createExecutorServer(deps: ServerDeps): Server {
           return;
         }
 
+        // Handle promotion meta-card decisions
+        const promotionData = (card.goal as unknown as Record<string, unknown>).promotionData as
+          import('../promoter.js').Promotion | undefined;
+        if (promotionData && card.goal.id.startsWith('meta-promote-')) {
+          if (decision === 'approve' && deps.rulesDir) {
+            // Write the rule to gmail.md
+            const gmailMdPath = join(deps.rulesDir, 'gmail.md');
+            const existing = existsSync(gmailMdPath) ? readFileSync(gmailMdPath, 'utf8') : '';
+            const newContent = existing
+              ? existing.trimEnd() + '\n' + promotionData.proposedRule + '\n'
+              : promotionData.proposedRule + '\n';
+            writeFileSync(gmailMdPath, newContent);
+            appendJournal(deps.journalPath, {
+              kind: 'rule_promoted',
+              patternKey: promotionData.patternKey,
+              goalId: card.goal.id,
+              senderDomain: promotionData.senderDomain,
+              action: promotionData.action,
+              proposedRule: promotionData.proposedRule,
+            });
+          } else if (decision === 'reject') {
+            appendJournal(deps.journalPath, {
+              kind: 'promotion_rejected',
+              patternKey: promotionData.patternKey,
+              goalId: card.goal.id,
+              senderDomain: promotionData.senderDomain,
+              action: promotionData.action,
+            });
+          }
+          queue.splice(idx, 1);
+          send(res, 200, JSON.stringify({ ok: true }));
+          return;
+        }
+
         appendJournal(deps.journalPath, {
           kind: 'decision',
           decision,
@@ -496,6 +574,13 @@ export function createExecutorServer(deps: ServerDeps): Server {
       // POST /verifier/run — manually trigger the verifier (for tests and debugging)
       if (req.method === 'POST' && url === '/verifier/run') {
         await runVerifier();
+        send(res, 200, JSON.stringify({ ok: true, queueDepth: queue.length }));
+        return;
+      }
+
+      // POST /promoter/run — manually trigger the rule promoter (for tests and debugging)
+      if (req.method === 'POST' && url === '/promoter/run') {
+        await runPromoter();
         send(res, 200, JSON.stringify({ ok: true, queueDepth: queue.length }));
         return;
       }

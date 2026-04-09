@@ -37,6 +37,15 @@ export interface VerifierConfig {
   interval_minutes: number;
 }
 
+export interface PromotionConfig {
+  /** Number of approved actions needed before proposing a rule. Defaults to 5. */
+  threshold: number;
+  /** Minutes to wait after a rejection before re-proposing. Defaults to 1440 (24h). */
+  cooldown_minutes: number;
+  /** How often the promoter runs, in minutes. Defaults to 120. */
+  interval_minutes: number;
+}
+
 export interface Rules {
   blacklist: BlacklistEntry[];
   redaction: RedactionRule[];
@@ -45,11 +54,14 @@ export interface Rules {
   floor: FloorReservation[];
   reversibility: ReversibilityDecl[];
   verifier: VerifierConfig;
+  promotion: PromotionConfig;
 }
 
 const DEFAULT_QUEUE: QueueConfig = { target_depth: 5, low_water_mark: 2, batch_threshold: 3 };
 
 const DEFAULT_VERIFIER: VerifierConfig = { interval_minutes: 60 };
+
+const DEFAULT_PROMOTION: PromotionConfig = { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 };
 
 const EMPTY_RULES: Rules = {
   blacklist: [],
@@ -59,6 +71,7 @@ const EMPTY_RULES: Rules = {
   floor: [],
   reversibility: [],
   verifier: { ...DEFAULT_VERIFIER },
+  promotion: { ...DEFAULT_PROMOTION },
 };
 
 function loadFile(path: string): Record<string, unknown> | null {
@@ -120,7 +133,14 @@ export function loadRules(dir: string): Rules {
     interval_minutes: typeof verifierRaw?.interval_minutes === 'number' ? verifierRaw.interval_minutes : DEFAULT_VERIFIER.interval_minutes,
   };
 
-  return { blacklist, redaction, queue, urgent_senders, floor, reversibility, verifier };
+  const promotionRaw = principles.promotion as Record<string, unknown> | undefined;
+  const promotion: PromotionConfig = {
+    threshold: typeof promotionRaw?.threshold === 'number' ? promotionRaw.threshold : DEFAULT_PROMOTION.threshold,
+    cooldown_minutes: typeof promotionRaw?.cooldown_minutes === 'number' ? promotionRaw.cooldown_minutes : DEFAULT_PROMOTION.cooldown_minutes,
+    interval_minutes: typeof promotionRaw?.interval_minutes === 'number' ? promotionRaw.interval_minutes : DEFAULT_PROMOTION.interval_minutes,
+  };
+
+  return { blacklist, redaction, queue, urgent_senders, floor, reversibility, verifier, promotion };
 }
 
 export function watchRules(

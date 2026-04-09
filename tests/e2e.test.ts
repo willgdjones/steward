@@ -19,6 +19,7 @@ const EMPTY_RULES: Rules = {
   floor: [],
   reversibility: [],
   verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
 };
 
 /** Adapter: wraps the trivial planGoal for the new PlannerInput signature. */
@@ -162,6 +163,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       floor: [],
       reversibility: [],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
 
     const server = createExecutorServer({
@@ -218,6 +220,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       floor: [],
       reversibility: [],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
 
     // Capture what the planner receives
@@ -350,6 +353,7 @@ describe('slice 004 two-stage pipeline', () => {
       floor: [],
       reversibility: [],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
 
     let plannerInput: PlannerInput | null = null;
@@ -456,6 +460,7 @@ describe('slice 005 queue with deterministic floor', () => {
       floor: [],
       reversibility: [],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
       ...rest,
     };
   }
@@ -689,6 +694,7 @@ describe('slice 006 archive via sub-agent', () => {
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
 
     const server = createExecutorServer({
@@ -752,6 +758,7 @@ describe('slice 006 archive via sub-agent', () => {
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
 
     const server = createExecutorServer({
@@ -802,6 +809,7 @@ describe('slice 006 archive via sub-agent', () => {
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
 
     const server = createExecutorServer({
@@ -863,6 +871,7 @@ describe('slice 007 batched action card', () => {
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
       verifier: { interval_minutes: 60 },
+  promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
   }
 
@@ -1275,5 +1284,242 @@ describe('slice 008 post-hoc verifier + meta-cards', () => {
     writeFileSync(join(dir, 'principles.md'), `blacklist: []\n`);
     const rules = loadRules(dir);
     expect(rules.verifier).toEqual({ interval_minutes: 60 });
+  });
+});
+
+describe('slice 009 rule promotion meta-cards', () => {
+  function makePromotionRules(overrides: Partial<import('../src/rules.js').PromotionConfig> = {}): Rules {
+    return {
+      blacklist: [],
+      redaction: [],
+      queue: { target_depth: 10, low_water_mark: 1, batch_threshold: 999 },
+      urgent_senders: [],
+      floor: [],
+      reversibility: [{ action: 'archive', reversible: true }],
+      verifier: { interval_minutes: 60 },
+      promotion: { threshold: 3, cooldown_minutes: 1440, interval_minutes: 120, ...overrides },
+    };
+  }
+
+  it('promoter detects pattern and surfaces a meta-card', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-009-promote-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const rules = makePromotionRules({ threshold: 3 });
+
+    // Seed the journal with 3 archive actions from substack.com
+    const { appendJournal: aj } = await import('../src/journal.js');
+    for (let i = 0; i < 3; i++) {
+      aj(journalPath, {
+        kind: 'action',
+        goalId: `g${i}`,
+        messageId: `m${i}`,
+        senderDomain: 'substack.com',
+        action: 'archive',
+        transport: 'gmail',
+        title: `Archive newsletter`,
+      });
+    }
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => rules,
+      rulesDir: dir,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // Trigger the promoter
+    const promRes = await fetch(`${base}/promoter/run`, { method: 'POST' });
+    expect(promRes.status).toBe(200);
+
+    // Queue should have a promotion meta-card
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ id: string; title: string; reason: string }> };
+    expect(q.depth).toBe(1);
+    expect(q.cards[0].id).toContain('meta-promote-');
+    expect(q.cards[0].title).toContain('substack.com');
+    expect(q.cards[0].reason).toContain('3');
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('approving a promotion meta-card writes rule to gmail.md', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-009-approve-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const rules = makePromotionRules({ threshold: 3 });
+
+    const { appendJournal: aj } = await import('../src/journal.js');
+    for (let i = 0; i < 3; i++) {
+      aj(journalPath, {
+        kind: 'action',
+        goalId: `g${i}`,
+        messageId: `m${i}`,
+        senderDomain: 'substack.com',
+        action: 'archive',
+        transport: 'gmail',
+      });
+    }
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => rules,
+      rulesDir: dir,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    await fetch(`${base}/promoter/run`, { method: 'POST' });
+
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+
+    // Approve the promotion
+    const decRes = await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(decRes.status).toBe(200);
+
+    // gmail.md should contain the new rule
+    const gmailMd = readFileSync(join(dir, 'gmail.md'), 'utf8');
+    expect(gmailMd).toContain('substack.com');
+    expect(gmailMd).toContain('archive');
+
+    // Journal should have a rule_promoted entry
+    const journal = readFileSync(journalPath, 'utf8').trim().split('\n');
+    const promoted = journal.map((l) => JSON.parse(l)).find((e: JournalEntry) => e.kind === 'rule_promoted');
+    expect(promoted).toBeDefined();
+    expect(promoted.patternKey).toBe('gmail::archive::substack.com');
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('rejecting a promotion journals a rejection and prevents re-proposal', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-009-reject-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const rules = makePromotionRules({ threshold: 3 });
+
+    const { appendJournal: aj } = await import('../src/journal.js');
+    for (let i = 0; i < 5; i++) {
+      aj(journalPath, {
+        kind: 'action',
+        goalId: `g${i}`,
+        messageId: `m${i}`,
+        senderDomain: 'substack.com',
+        action: 'archive',
+        transport: 'gmail',
+      });
+    }
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => rules,
+      rulesDir: dir,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // Trigger and get the meta-card
+    await fetch(`${base}/promoter/run`, { method: 'POST' });
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+
+    // Reject it
+    await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'reject' }),
+    });
+
+    // Journal should have a promotion_rejected entry
+    const journal = readFileSync(journalPath, 'utf8').trim().split('\n');
+    const rejected = journal.map((l) => JSON.parse(l)).find((e: JournalEntry) => e.kind === 'promotion_rejected');
+    expect(rejected).toBeDefined();
+    expect(rejected.patternKey).toBe('gmail::archive::substack.com');
+
+    // Running promoter again should NOT create a new meta-card (cooldown)
+    await fetch(`${base}/promoter/run`, { method: 'POST' });
+    const q = (await (await fetch(`${base}/queue`)).json()) as { depth: number };
+    expect(q.depth).toBe(0);
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('promoter does not re-propose already promoted rules', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-009-dedup-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const rules = makePromotionRules({ threshold: 3 });
+
+    const { appendJournal: aj } = await import('../src/journal.js');
+    for (let i = 0; i < 5; i++) {
+      aj(journalPath, {
+        kind: 'action',
+        goalId: `g${i}`,
+        messageId: `m${i}`,
+        senderDomain: 'substack.com',
+        action: 'archive',
+        transport: 'gmail',
+      });
+    }
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => rules,
+      rulesDir: dir,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // First run and approve
+    await fetch(`${base}/promoter/run`, { method: 'POST' });
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+
+    // Second run should not create a new meta-card
+    await fetch(`${base}/promoter/run`, { method: 'POST' });
+    const q = (await (await fetch(`${base}/queue`)).json()) as { depth: number };
+    expect(q.depth).toBe(0);
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('promotion config parsed from principles.md', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-009-config-'));
+    writeFileSync(join(dir, 'principles.md'), `promotion:\n  threshold: 10\n  cooldown_minutes: 720\n  interval_minutes: 60\n`);
+    const rules = loadRules(dir);
+    expect(rules.promotion).toEqual({ threshold: 10, cooldown_minutes: 720, interval_minutes: 60 });
+  });
+
+  it('promotion config defaults when not specified', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-009-config-default-'));
+    writeFileSync(join(dir, 'principles.md'), `blacklist: []\n`);
+    const rules = loadRules(dir);
+    expect(rules.promotion).toEqual({ threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 });
   });
 });
