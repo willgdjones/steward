@@ -2,6 +2,16 @@
 
 ## 2026-04-09
 
+### Slice 004 — frontier triage in the loop
+- Two-stage pipeline: cheap model (Haiku) extracts structured features from full message, expensive model (Sonnet/Opus) produces real goals from redacted slice + features.
+- `src/triage.ts`: `TriageFeatures` type (deadline, amount, waiting_on_user, category, urgency), `createTriage()` factory backed by Anthropic SDK, `defaultTriageResult()` fallback.
+- `src/planner/index.ts`: `PlannerInput` type carries redacted message + triage features + snippet. `createPlanner()` factory for frontier model. Trivial `planGoal()` preserved as fallback.
+- `src/executor/server.ts`: pipeline now runs triage → redact → plan. `ServerDeps` accepts injectable `triage` function and `searchQuery`.
+- `src/gmail/fake.ts`: added `search(query)` method (returns unread messages; real Gmail API query deferred).
+- `src/executor/index.ts`: auto-detects `ANTHROPIC_API_KEY` and activates frontier pipeline; falls back to trivial planner otherwise.
+- `@anthropic-ai/sdk` added as runtime dependency.
+- 30 tests across 6 files; 4 new tests for the two-stage pipeline covering data flow, redaction ordering, search, and fallback.
+
 ### Slice 003 — rules files, principles gate, redactor pipeline
 - Rules loader (`src/rules.ts`) parses `principles.md` as YAML, extracting blacklist entries and redaction rules. Watches the directory for file changes and reloads automatically.
 - Principles gate (`src/principlesGate.ts`) enforces a `(transport, action_class)` blacklist before dispatching any approved action. Blocked actions return 403 and are journalled as `kind: blocked`.

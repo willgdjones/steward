@@ -33,4 +33,13 @@ export class FakeGmail {
     const messages = this.load();
     return messages.find((m) => m.unread) ?? null;
   }
+
+  /**
+   * Search messages by query string. For FakeGmail this just returns
+   * unread messages (the query is ignored). Real Gmail (issue 004+)
+   * will use the Gmail API search.
+   */
+  search(_query: string): GmailMessage[] {
+    return this.load().filter((m) => m.unread);
+  }
 }

@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { FakeGmail, type GmailMessage } from '../gmail/fake.js';
 import { redact, applyRedactionRules, type RedactedMessage } from '../redactor.js';
-import type { Goal } from '../planner/index.js';
+import type { Goal, PlannerInput } from '../planner/index.js';
+import type { TriageFn, TriageResult } from '../triage.js';
+import { defaultTriageResult } from '../triage.js';
 import { appendJournal } from '../journal.js';
 import { checkBlacklist } from '../principlesGate.js';
 import type { Rules } from '../rules.js';
@@ -11,10 +13,14 @@ export type Decision = 'approve' | 'reject' | 'defer';
 export interface ServerDeps {
   gmail: FakeGmail;
   journalPath: string;
+  /** Triage function (cheap model). If omitted, uses default features. */
+  triage?: TriageFn;
   /** Injected so tests can avoid spawning a subprocess. */
-  plan: (msg: RedactedMessage) => Promise<Goal>;
+  plan: (input: PlannerInput) => Promise<Goal>;
   /** Returns current rules; may be updated by file watcher. */
   getRules: () => Rules;
+  /** Gmail search query. Defaults to 'is:unread'. */
+  searchQuery?: string;
 }
 
 interface CardState {
@@ -30,7 +36,7 @@ body{font-family:system-ui;max-width:480px;margin:2em auto;padding:1em}
 button{margin-right:.5em;padding:.5em 1em}
 </style></head><body>
 <h1>steward</h1>
-<div id="card">loading…</div>
+<div id="card">loading\u2026</div>
 <script>
 async function load(){
   const r = await fetch('/card');
@@ -51,14 +57,31 @@ load();
 
 export function createExecutorServer(deps: ServerDeps): Server {
   let current: CardState | null = null;
+  const searchQuery = deps.searchQuery ?? 'is:unread';
 
   async function refill(): Promise<void> {
     if (current) return;
-    const message = deps.gmail.readOneUnread();
-    if (!message) return;
+    const candidates = deps.gmail.search(searchQuery);
+    if (candidates.length === 0) return;
+
+    // Take the first candidate (ranking comes in slice 005)
+    const message = candidates[0];
+
+    // Stage 1: Triage (cheap model) — sees full message
+    const triageResult: TriageResult = deps.triage
+      ? await deps.triage(message)
+      : defaultTriageResult();
+
+    // Stage 2: Redact — deterministic, between triage and planner
     const base = redact(message);
     const redacted = applyRedactionRules(base, deps.getRules().redaction);
-    const goal = await deps.plan(redacted);
+
+    // Stage 3: Plan (expensive model) — sees only redacted message + features
+    const goal = await deps.plan({
+      message: redacted,
+      features: triageResult.features,
+      snippet: triageResult.snippet,
+    });
     current = { goal, message };
   }
 

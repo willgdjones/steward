@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import type { RedactedMessage } from '../redactor.js';
-import type { Goal } from '../planner/index.js';
+import type { Goal, PlannerInput } from '../planner/index.js';
 
 /**
  * Spawn the planner as a separate child process. The executor's
@@ -25,7 +25,7 @@ export function sanitiseEnvForPlanner(
 }
 
 export async function runPlanner(
-  message: RedactedMessage,
+  input: PlannerInput | RedactedMessage,
   plannerScript: string,
 ): Promise<Goal> {
   return new Promise((resolve, reject) => {
@@ -48,7 +48,7 @@ export async function runPlanner(
         reject(new Error(`planner output not JSON: ${line}`));
       }
     });
-    child.stdin.write(JSON.stringify(message) + '\n');
+    child.stdin.write(JSON.stringify(input) + '\n');
     child.stdin.end();
   });
 }
