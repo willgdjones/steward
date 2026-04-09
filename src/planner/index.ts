@@ -12,6 +12,10 @@ export interface Goal {
   transport?: string;
   /** Action class (e.g. 'archive', 'send', 'delete'). */
   action?: string;
+  /** For batched goals: all message IDs in the batch. */
+  messageIds?: string[];
+  /** For batched goals: total count of messages in the batch. */
+  batchSize?: number;
 }
 
 /** Input to the planner: redacted message plus triage features. */

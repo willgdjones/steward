@@ -9,6 +9,7 @@ import { checkBlacklist } from '../principlesGate.js';
 import type { Rules } from '../rules.js';
 import { rankCandidates, type RankInput } from '../ranker.js';
 import { createGmailSubAgent, type GmailSubAgent } from '../gmail/subagent.js';
+import { clusterCandidates, type TriagedCandidate } from '../batcher.js';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -29,6 +30,8 @@ interface CardState {
   goal: Goal;
   message: GmailMessage;
   features: import('../triage.js').TriageFeatures;
+  /** For batched cards, all messages in the batch. */
+  batchMessages?: GmailMessage[];
 }
 
 const WEB_CLIENT_HTML = `<!doctype html>
@@ -86,12 +89,49 @@ export function createExecutorServer(deps: ServerDeps): Server {
     return { goal, message, features: triageResult.features };
   }
 
+  async function planAndEnqueue(entry: TriagedCandidate): Promise<CardState> {
+    const base = redact(entry.message);
+    const redacted = applyRedactionRules(base, deps.getRules().redaction);
+    const goal = await deps.plan({
+      message: redacted,
+      features: entry.result.features,
+      snippet: entry.result.snippet,
+    });
+    return { goal, message: entry.message, features: entry.result.features };
+  }
+
+  function makeBatchedCard(cluster: import('../batcher.js').Cluster): CardState {
+    const msgs = cluster.candidates.map((c) => c.message);
+    const messageIds = msgs.map((m) => m.id);
+    const sampleDomains = [...new Set(msgs.map((m) => {
+      const at = m.from.lastIndexOf('@');
+      return at >= 0 ? m.from.slice(at + 1) : m.from;
+    }))].slice(0, 3);
+    const sampleText = sampleDomains.join(', ');
+    const goal: Goal = {
+      id: `batch-${cluster.domain}-${Date.now()}`,
+      title: `Archive ${msgs.length} ${cluster.category} from ${cluster.domain}`,
+      reason: `Batch: ${msgs.length} similar messages (${sampleText})`,
+      messageId: msgs[0].id,
+      messageIds,
+      batchSize: msgs.length,
+      transport: 'gmail',
+      action: 'archive',
+    };
+    return {
+      goal,
+      message: msgs[0],
+      features: cluster.candidates[0].result.features,
+      batchMessages: msgs,
+    };
+  }
+
   async function refill(): Promise<void> {
     if (refilling) return;
     refilling = true;
     try {
       const rules = deps.getRules();
-      const { target_depth, low_water_mark } = rules.queue;
+      const { target_depth, low_water_mark, batch_threshold } = rules.queue;
 
       // Only refill when below low-water mark
       if (queue.length >= low_water_mark) return;
@@ -104,7 +144,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
       if (fresh.length === 0) return;
 
       // Triage all fresh candidates to get features for ranking
-      const triaged: Array<{ message: GmailMessage; result: TriageResult }> = [];
+      const triaged: TriagedCandidate[] = [];
       for (const message of fresh) {
         const result: TriageResult = deps.triage
           ? await deps.triage(message)
@@ -114,8 +154,8 @@ export function createExecutorServer(deps: ServerDeps): Server {
 
       // Check for urgent senders — inject immediately at front of queue
       const urgentSenders = rules.urgent_senders;
-      const urgentMessages: typeof triaged = [];
-      const normalMessages: typeof triaged = [];
+      const urgentMessages: TriagedCandidate[] = [];
+      const normalMessages: TriagedCandidate[] = [];
 
       for (const t of triaged) {
         const senderEmail = t.message.from.toLowerCase();
@@ -132,8 +172,21 @@ export function createExecutorServer(deps: ServerDeps): Server {
         }
       }
 
-      // Rank normal candidates
-      const rankInputs: RankInput[] = normalMessages.map((t) => ({
+      // Cluster normal candidates for batched cards
+      const { batches, remaining } = clusterCandidates(normalMessages, batch_threshold);
+
+      // Insert batched cards
+      for (const cluster of batches) {
+        if (queue.length >= target_depth) break;
+        const batchCard = makeBatchedCard(cluster);
+        queue.push(batchCard);
+        for (const c of cluster.candidates) {
+          queuedMessageIds.add(c.message.id);
+        }
+      }
+
+      // Rank remaining (non-batched) candidates
+      const rankInputs: RankInput[] = remaining.map((t) => ({
         messageId: t.message.id,
         features: t.result.features,
       }));
@@ -146,20 +199,19 @@ export function createExecutorServer(deps: ServerDeps): Server {
       // Process urgent messages first (bypass queue depth for insertion at front)
       for (const urgent of urgentMessages) {
         if (queuedMessageIds.has(urgent.message.id)) continue;
-        const base = redact(urgent.message);
-        const redacted = applyRedactionRules(base, deps.getRules().redaction);
-        const goal = await deps.plan({
-          message: redacted,
-          features: urgent.result.features,
-          snippet: urgent.result.snippet,
-        });
+        const card = await planAndEnqueue(urgent);
         // Insert at front but still respect target_depth
         if (queue.length >= target_depth) {
-          // Remove lowest-priority item from back to make room
           const removed = queue.pop();
-          if (removed) queuedMessageIds.delete(removed.message.id);
+          if (removed) {
+            if (removed.batchMessages) {
+              for (const m of removed.batchMessages) queuedMessageIds.delete(m.id);
+            } else {
+              queuedMessageIds.delete(removed.message.id);
+            }
+          }
         }
-        queue.unshift({ goal, message: urgent.message, features: urgent.result.features });
+        queue.unshift(card);
         queuedMessageIds.add(urgent.message.id);
       }
 
@@ -170,14 +222,8 @@ export function createExecutorServer(deps: ServerDeps): Server {
         if (!entry) continue;
         if (queuedMessageIds.has(r.messageId)) continue;
 
-        const base = redact(entry.message);
-        const redacted = applyRedactionRules(base, deps.getRules().redaction);
-        const goal = await deps.plan({
-          message: redacted,
-          features: entry.result.features,
-          snippet: entry.result.snippet,
-        });
-        queue.push({ goal, message: entry.message, features: entry.result.features });
+        const card = await planAndEnqueue(entry);
+        queue.push(card);
         queuedMessageIds.add(entry.message.id);
       }
     } finally {
@@ -267,33 +313,65 @@ export function createExecutorServer(deps: ServerDeps): Server {
               reason: gate.reason,
             });
             queue.splice(idx, 1);
-            queuedMessageIds.delete(card.message.id);
+            if (card.batchMessages) {
+              for (const m of card.batchMessages) queuedMessageIds.delete(m.id);
+            } else {
+              queuedMessageIds.delete(card.message.id);
+            }
             send(res, 403, JSON.stringify({ error: 'blocked', reason: gate.reason }));
             return;
           }
         }
         // If approving an actionable goal, dispatch to the sub-agent
         if (decision === 'approve' && card.goal.action === 'archive' && card.goal.transport === 'gmail') {
-          const instruction = {
-            capability: card.goal.action,
-            messageId: card.message.id,
-            instruction: `Archive message "${card.goal.title}" (${card.message.subject})`,
-          };
-          const outcome = await gmailSubAgent.dispatch(instruction);
-          const verification = await gmailSubAgent.verify(card.message.id, card.goal.action);
+          const isBatch = card.batchMessages && card.batchMessages.length > 1;
+          const messageIds = isBatch ? card.batchMessages!.map((m) => m.id) : [card.message.id];
+
+          // Dispatch archive for all messages in the batch (or single message)
+          const outcomes = [];
+          for (const msgId of messageIds) {
+            const instruction = {
+              capability: card.goal.action,
+              messageId: msgId,
+              instruction: `Archive message (batch: ${card.goal.title})`,
+            };
+            const outcome = await gmailSubAgent.dispatch(instruction);
+            outcomes.push(outcome);
+          }
+
+          // Verify a sample: first, last, and one from the middle
+          const sampleIds = isBatch
+            ? [...new Set([messageIds[0], messageIds[Math.floor(messageIds.length / 2)], messageIds[messageIds.length - 1]])]
+            : messageIds;
+          const verifications = [];
+          for (const msgId of sampleIds) {
+            const v = await gmailSubAgent.verify(msgId, card.goal.action);
+            verifications.push(v);
+          }
+          const allVerified = verifications.every((v) => v.verified);
 
           appendJournal(deps.journalPath, {
             kind: 'action',
             goalId: card.goal.id,
             messageId: card.message.id,
+            messageIds,
+            batchSize: messageIds.length,
             title: card.goal.title,
-            instruction,
-            outcome,
-            verification,
+            outcomes,
+            verification: { verified: allVerified, sample: verifications },
           });
+
+          // Remove card and clean up all queued message IDs
           queue.splice(idx, 1);
-          queuedMessageIds.delete(card.message.id);
-          send(res, 200, JSON.stringify({ ok: true, outcome, verification }));
+          for (const msgId of messageIds) {
+            queuedMessageIds.delete(msgId);
+          }
+          send(res, 200, JSON.stringify({
+            ok: true,
+            outcomes,
+            verification: { verified: allVerified, sample: verifications },
+            batchSize: messageIds.length,
+          }));
           return;
         }
 
@@ -305,7 +383,11 @@ export function createExecutorServer(deps: ServerDeps): Server {
           title: card.goal.title,
         });
         queue.splice(idx, 1);
-        queuedMessageIds.delete(card.message.id);
+        if (card.batchMessages) {
+          for (const m of card.batchMessages) queuedMessageIds.delete(m.id);
+        } else {
+          queuedMessageIds.delete(card.message.id);
+        }
         send(res, 200, JSON.stringify({ ok: true }));
         return;
       }

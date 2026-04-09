@@ -14,7 +14,7 @@ import type { JournalEntry } from '../src/journal.js';
 const EMPTY_RULES: Rules = {
   blacklist: [],
   redaction: [],
-  queue: { target_depth: 5, low_water_mark: 2 },
+  queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 999 },
   urgent_senders: [],
   floor: [],
   reversibility: [],
@@ -80,7 +80,7 @@ describe('slice 002 end-to-end skeleton', () => {
       goalId: goal.id,
       messageId: 'm1',
     });
-    expect(entry.outcome).toMatchObject({ success: true, action_taken: 'archive' });
+    expect((entry.outcomes as unknown[])[0]).toMatchObject({ success: true, action_taken: 'archive' });
     expect(entry.verification).toMatchObject({ verified: true });
   });
 
@@ -156,7 +156,7 @@ describe('slice 003 principles gate + redactor rules', () => {
     const rules: Rules = {
       blacklist: [{ transport: 'gmail', action: 'archive' }],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
       urgent_senders: [],
       floor: [],
       reversibility: [],
@@ -211,7 +211,7 @@ describe('slice 003 principles gate + redactor rules', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [{ field: 'subject', pattern: '\\d{4}-\\d{4}' }],
-      queue: { target_depth: 5, low_water_mark: 2 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
       urgent_senders: [],
       floor: [],
       reversibility: [],
@@ -342,7 +342,7 @@ describe('slice 004 two-stage pipeline', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [{ field: 'subject', pattern: '\\d{8}' }],
-      queue: { target_depth: 5, low_water_mark: 2 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
       urgent_senders: [],
       floor: [],
       reversibility: [],
@@ -441,15 +441,17 @@ describe('slice 005 queue with deterministic floor', () => {
     }));
   }
 
-  function makeQueueRules(overrides: Partial<Rules> = {}): Rules {
+  function makeQueueRules(overrides: Omit<Partial<Rules>, 'queue'> & { queue?: Partial<import('../src/rules.js').QueueConfig> } = {}): Rules {
+    const defaultQueue = { target_depth: 3, low_water_mark: 1, batch_threshold: 999 };
+    const { queue: queueOverrides, ...rest } = overrides;
     return {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 3, low_water_mark: 1 },
+      queue: { ...defaultQueue, ...queueOverrides },
       urgent_senders: [],
       floor: [],
       reversibility: [],
-      ...overrides,
+      ...rest,
     };
   }
 
@@ -578,7 +580,7 @@ describe('slice 005 queue with deterministic floor', () => {
   it('urgent senders bypass queue and surface immediately', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'steward-005-urgent-'));
     const rules = makeQueueRules({
-      queue: { target_depth: 3, low_water_mark: 1 },
+      queue: { target_depth: 3, low_water_mark: 1, batch_threshold: 999 },
       urgent_senders: ['boss@important.com'],
     });
     const messages = [
@@ -602,7 +604,7 @@ describe('slice 005 queue with deterministic floor', () => {
     const dir = mkdtempSync(join(tmpdir(), 'steward-005-floor-'));
     const now = new Date('2026-04-09T12:00:00Z');
     const rules = makeQueueRules({
-      queue: { target_depth: 3, low_water_mark: 1 },
+      queue: { target_depth: 3, low_water_mark: 1, batch_threshold: 999 },
       floor: [{ match: { deadline_within_hours: 72 }, slots: 1 }],
     });
 
@@ -677,7 +679,7 @@ describe('slice 006 archive via sub-agent', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
@@ -706,24 +708,24 @@ describe('slice 006 archive via sub-agent', () => {
       body: JSON.stringify({ decision: 'approve' }),
     });
     expect(decRes.status).toBe(200);
-    const decBody = (await decRes.json()) as { ok: boolean; outcome: unknown; verification: unknown };
+    const decBody = (await decRes.json()) as { ok: boolean; outcomes: unknown[]; verification: { verified: boolean; sample: unknown[] } };
     expect(decBody.ok).toBe(true);
-    expect(decBody.outcome).toMatchObject({ success: true, action_taken: 'archive' });
-    expect(decBody.verification).toMatchObject({ verified: true, actual_state: 'archived' });
+    expect(decBody.outcomes[0]).toMatchObject({ success: true, action_taken: 'archive' });
+    expect(decBody.verification.verified).toBe(true);
 
     // Verify the message is archived in FakeGmail
     const msg = gmail.getById('m1');
     expect(msg).not.toBeNull();
     expect(msg!.archived).toBe(true);
 
-    // Journal should have goal, instruction, outcome, and verification
+    // Journal should have goal, outcomes, and verification
     const lines = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
     const entries = lines.map((l) => JSON.parse(l) as JournalEntry);
     const actionEntry = entries.find((e) => e.kind === 'action');
     expect(actionEntry).toBeDefined();
     expect(actionEntry!.goalId).toBe(goal.id);
-    expect(actionEntry!.instruction).toBeDefined();
-    expect(actionEntry!.outcome).toMatchObject({ success: true });
+    expect(actionEntry!.outcomes).toBeDefined();
+    expect((actionEntry!.outcomes as unknown[])[0]).toMatchObject({ success: true });
     expect(actionEntry!.verification).toMatchObject({ verified: true });
 
     await new Promise<void>((r) => server.close(() => r()));
@@ -739,7 +741,7 @@ describe('slice 006 archive via sub-agent', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
@@ -788,7 +790,7 @@ describe('slice 006 archive via sub-agent', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
@@ -836,5 +838,249 @@ describe('slice 006 archive via sub-agent', () => {
       { action: 'archive', reversible: true },
       { action: 'send', reversible: false },
     ]);
+  });
+});
+
+describe('slice 007 batched action card', () => {
+  function makeBatchRules(overrides: Partial<{ batch_threshold: number; target_depth: number }> = {}): Rules {
+    return {
+      blacklist: [],
+      redaction: [],
+      queue: {
+        target_depth: overrides.target_depth ?? 10,
+        low_water_mark: 1,
+        batch_threshold: overrides.batch_threshold ?? 3,
+      },
+      urgent_senders: [],
+      floor: [],
+      reversibility: [{ action: 'archive', reversible: true }],
+    };
+  }
+
+  it('clusters similar messages into a batched card', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-007-cluster-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@newsletters.com', subject: 'Newsletter 1', body: 'b', unread: true },
+      { id: 'm2', from: 'b@newsletters.com', subject: 'Newsletter 2', body: 'b', unread: true },
+      { id: 'm3', from: 'c@newsletters.com', subject: 'Newsletter 3', body: 'b', unread: true },
+      { id: 'm4', from: 'user@other.com', subject: 'Personal msg', body: 'b', unread: true },
+    ]);
+
+    const rules = makeBatchRules({ batch_threshold: 3 });
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    await fetch(`${base}/card`);
+
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ messageIds?: string[]; batchSize?: number; title: string }> };
+
+    // Should have 2 cards: 1 batched (3 newsletters) + 1 individual
+    expect(q.depth).toBe(2);
+
+    const batchCard = q.cards.find((c) => c.batchSize);
+    expect(batchCard).toBeDefined();
+    expect(batchCard!.batchSize).toBe(3);
+    expect(batchCard!.messageIds).toHaveLength(3);
+    expect(batchCard!.title).toContain('newsletters.com');
+    expect(batchCard!.title).toContain('3');
+
+    const singleCard = q.cards.find((c) => !c.batchSize);
+    expect(singleCard).toBeDefined();
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('one swipe archives all messages in a batch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-007-swipe-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@promo.com', subject: 'Promo 1', body: 'b', unread: true },
+      { id: 'm2', from: 'b@promo.com', subject: 'Promo 2', body: 'b', unread: true },
+      { id: 'm3', from: 'c@promo.com', subject: 'Promo 3', body: 'b', unread: true },
+      { id: 'm4', from: 'd@promo.com', subject: 'Promo 4', body: 'b', unread: true },
+    ]);
+
+    const rules = makeBatchRules({ batch_threshold: 3 });
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // Get the batched card
+    const cardRes = await fetch(`${base}/card`);
+    expect(cardRes.status).toBe(200);
+    const goal = (await cardRes.json()) as { id: string; batchSize: number; messageIds: string[] };
+    expect(goal.batchSize).toBe(4);
+
+    // Approve the batch — one swipe
+    const decRes = await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(decRes.status).toBe(200);
+    const body = (await decRes.json()) as {
+      ok: boolean;
+      outcomes: Array<{ success: boolean }>;
+      verification: { verified: boolean; sample: unknown[] };
+      batchSize: number;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.batchSize).toBe(4);
+    expect(body.outcomes).toHaveLength(4);
+    expect(body.outcomes.every((o) => o.success)).toBe(true);
+    expect(body.verification.verified).toBe(true);
+
+    // All messages should be archived in FakeGmail
+    for (const id of ['m1', 'm2', 'm3', 'm4']) {
+      const msg = gmail.getById(id);
+      expect(msg).not.toBeNull();
+      expect(msg!.archived).toBe(true);
+    }
+
+    // Queue should be empty (no more unread, non-archived messages)
+    const nextCard = await fetch(`${base}/card`);
+    expect(nextCard.status).toBe(204);
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('journal records the full message-ID list for a batch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-007-journal-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@bulk.com', subject: 'Bulk 1', body: 'b', unread: true },
+      { id: 'm2', from: 'b@bulk.com', subject: 'Bulk 2', body: 'b', unread: true },
+      { id: 'm3', from: 'c@bulk.com', subject: 'Bulk 3', body: 'b', unread: true },
+    ]);
+
+    const rules = makeBatchRules({ batch_threshold: 3 });
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+
+    await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+
+    const lines = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
+    const entry = JSON.parse(lines[0]) as JournalEntry;
+    expect(entry.kind).toBe('action');
+    expect(entry.messageIds).toEqual(['m1', 'm2', 'm3']);
+    expect(entry.batchSize).toBe(3);
+    expect((entry.outcomes as unknown[]).length).toBe(3);
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('verification samples first, middle, and last in a large batch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-007-verify-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    const messages = Array.from({ length: 7 }, (_, i) => ({
+      id: `m${i}`,
+      from: `sender${i}@biglist.com`,
+      subject: `Item ${i}`,
+      body: 'b',
+      unread: true,
+    }));
+    gmail.save(messages);
+
+    const rules = makeBatchRules({ batch_threshold: 3 });
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string; batchSize: number };
+    expect(goal.batchSize).toBe(7);
+
+    const decRes = await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const body = (await decRes.json()) as {
+      verification: { verified: boolean; sample: Array<{ messageId: string }> };
+    };
+
+    // Should verify 3 samples: first (m0), middle (m3), last (m6)
+    expect(body.verification.sample.length).toBe(3);
+    const sampledIds = body.verification.sample.map((v) => v.messageId);
+    expect(sampledIds).toContain('m0');
+    expect(sampledIds).toContain('m3');
+    expect(sampledIds).toContain('m6');
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('batch_threshold is configurable in principles.md', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-007-config-'));
+    writeFileSync(
+      join(dir, 'principles.md'),
+      `queue:\n  target_depth: 10\n  low_water_mark: 3\n  batch_threshold: 5\n`,
+    );
+    const rules = loadRules(dir);
+    expect(rules.queue.batch_threshold).toBe(5);
+  });
+
+  it('below-threshold clusters produce individual cards, not batched', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-007-below-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@news.com', subject: 'News 1', body: 'b', unread: true },
+      { id: 'm2', from: 'b@news.com', subject: 'News 2', body: 'b', unread: true },
+    ]);
+
+    const rules = makeBatchRules({ batch_threshold: 3 });
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    await fetch(`${base}/card`);
+
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ batchSize?: number }> };
+    expect(q.depth).toBe(2);
+    // No batched cards — all individual
+    expect(q.cards.every((c) => !c.batchSize)).toBe(true);
+
+    await new Promise<void>((r) => server.close(() => r()));
   });
 });

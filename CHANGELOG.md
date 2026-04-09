@@ -2,6 +2,14 @@
 
 ## 2026-04-09
 
+### Slice 007 — batched action card
+- Collapse N similar archive goals into a single batched-action card. Clusters messages by (sender domain, category) and produces a batched card when ≥`batch_threshold` similar candidates exist.
+- `src/batcher.ts` (NEW): `clusterCandidates()` groups triaged candidates by domain+category, returns batches meeting threshold alongside unclustered remainder.
+- `src/planner/index.ts`: `Goal` extended with optional `messageIds: string[]` and `batchSize: number` for batched goals.
+- `src/rules.ts`: `QueueConfig` extended with `batch_threshold` (default 3, configurable in `principles.md`).
+- `src/executor/server.ts`: refill pipeline clusters candidates before ranking; batched cards carry all messages. Approval dispatches archive for every message in the batch, verifies a sample (first, middle, last), journals with full message-ID list.
+- 70 tests across 9 files; 11 new tests covering clustering, batch dispatch, sample verification, journal ID list, config parsing, and below-threshold fallback.
+
 ### Slice 006 — archive via Gmail sub-agent
 - First real action: approving an archive card dispatches to the Gmail sub-agent, archives the message, verifies the result, and journals the full flow.
 - `src/gmail/subagent.ts` (NEW): `GmailSubAgent` with `dispatch()` and `verify()` methods. Takes free-form `SubAgentInstruction`, returns structured `SubAgentOutcome`. Verification re-fetches the message and confirms archived state.
