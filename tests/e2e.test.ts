@@ -18,6 +18,7 @@ const EMPTY_RULES: Rules = {
   urgent_senders: [],
   floor: [],
   reversibility: [],
+  verifier: { interval_minutes: 60 },
 };
 
 /** Adapter: wraps the trivial planGoal for the new PlannerInput signature. */
@@ -160,6 +161,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      verifier: { interval_minutes: 60 },
     };
 
     const server = createExecutorServer({
@@ -215,6 +217,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      verifier: { interval_minutes: 60 },
     };
 
     // Capture what the planner receives
@@ -346,6 +349,7 @@ describe('slice 004 two-stage pipeline', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      verifier: { interval_minutes: 60 },
     };
 
     let plannerInput: PlannerInput | null = null;
@@ -451,6 +455,7 @@ describe('slice 005 queue with deterministic floor', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      verifier: { interval_minutes: 60 },
       ...rest,
     };
   }
@@ -683,6 +688,7 @@ describe('slice 006 archive via sub-agent', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      verifier: { interval_minutes: 60 },
     };
 
     const server = createExecutorServer({
@@ -745,6 +751,7 @@ describe('slice 006 archive via sub-agent', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      verifier: { interval_minutes: 60 },
     };
 
     const server = createExecutorServer({
@@ -794,6 +801,7 @@ describe('slice 006 archive via sub-agent', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      verifier: { interval_minutes: 60 },
     };
 
     const server = createExecutorServer({
@@ -854,6 +862,7 @@ describe('slice 007 batched action card', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      verifier: { interval_minutes: 60 },
     };
   }
 
@@ -1082,5 +1091,189 @@ describe('slice 007 batched action card', () => {
     expect(q.cards.every((c) => !c.batchSize)).toBe(true);
 
     await new Promise<void>((r) => server.close(() => r()));
+  });
+});
+
+describe('slice 008 post-hoc verifier + meta-cards', () => {
+  it('POST /verifier/run detects unarchived message and inserts meta-card', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-008-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    // Message exists but was unarchived by user
+    gmail.save([
+      { id: 'm1', from: 'news@sub.com', subject: 'Newsletter', body: '', unread: true, archived: false },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const { appendJournal: aj } = await import('../src/journal.js');
+    aj(journalPath, {
+      kind: 'action',
+      goalId: 'g1',
+      messageId: 'm1',
+      title: 'Archive newsletter',
+      outcomes: [{ success: true, action_taken: 'archive', messageId: 'm1' }],
+      verification: { verified: true, sample: [] },
+    });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // Run verifier
+    const verifyRes = await fetch(`${base}/verifier/run`, { method: 'POST' });
+    expect(verifyRes.status).toBe(200);
+
+    // Queue should now have a meta-card
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ id: string; title: string; reason: string }> };
+    expect(q.depth).toBe(1);
+    expect(q.cards[0].title).toContain('unarchived');
+    expect(q.cards[0].id).toContain('meta-');
+
+    // Running verifier again should not duplicate
+    await fetch(`${base}/verifier/run`, { method: 'POST' });
+    const q2 = (await (await fetch(`${base}/queue`)).json()) as { depth: number };
+    expect(q2.depth).toBe(1);
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('POST /verifier/run detects reply-after-archive', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-008-reply-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'Project update', body: '', unread: false, archived: true },
+      { id: 'm2', from: 'alice@example.com', subject: 'Re: Project update', body: 'follow-up', unread: true },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const { appendJournal: aj } = await import('../src/journal.js');
+    aj(journalPath, {
+      kind: 'action',
+      goalId: 'g1',
+      messageId: 'm1',
+      title: 'Archive project update',
+      outcomes: [{ success: true, action_taken: 'archive', messageId: 'm1' }],
+      verification: { verified: true, sample: [] },
+    });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    await fetch(`${base}/verifier/run`, { method: 'POST' });
+    const q = (await (await fetch(`${base}/queue`)).json()) as { depth: number; cards: Array<{ id: string; title: string }> };
+    expect(q.depth).toBe(1);
+    expect(q.cards[0].title).toContain('reply');
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('GET /activity returns recent action entries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-008-activity-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@b.com', subject: 'test', body: '', unread: true },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const { appendJournal: aj } = await import('../src/journal.js');
+    aj(journalPath, {
+      kind: 'action',
+      goalId: 'g1',
+      messageId: 'm1',
+      title: 'Archive test',
+      outcomes: [{ success: true, action_taken: 'archive', messageId: 'm1' }],
+      verification: { verified: true, sample: [] },
+    });
+    aj(journalPath, { kind: 'decision', decision: 'reject', goalId: 'g2', messageId: 'm2' });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+
+    const res = await fetch(`http://127.0.0.1:${port}/activity`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { entries: Array<{ kind: string; goalId: string }> };
+    // Only action entries, not decisions
+    expect(body.entries).toHaveLength(1);
+    expect(body.entries[0]).toMatchObject({ kind: 'action', goalId: 'g1' });
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('POST /activity/:goalId/wrong emits a meta-card', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-008-wrong-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@b.com', subject: 'newsletter', body: '', unread: false, archived: true },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const { appendJournal: aj } = await import('../src/journal.js');
+    aj(journalPath, {
+      kind: 'action',
+      goalId: 'g1',
+      messageId: 'm1',
+      title: 'Archive newsletter',
+      outcomes: [{ success: true, action_taken: 'archive', messageId: 'm1' }],
+      verification: { verified: true, sample: [] },
+    });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    const res = await fetch(`${base}/activity/g1/wrong`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; metaCardId: string };
+    expect(body.ok).toBe(true);
+    expect(body.metaCardId).toContain('meta-wrong-');
+
+    // Meta-card should be in the queue
+    const q = (await (await fetch(`${base}/queue`)).json()) as { depth: number; cards: Array<{ id: string; title: string }> };
+    expect(q.depth).toBe(1);
+    expect(q.cards[0].title).toContain('wrong');
+
+    // Clicking wrong again is idempotent
+    const res2 = await fetch(`${base}/activity/g1/wrong`, { method: 'POST' });
+    const body2 = (await res2.json()) as { ok: boolean; alreadyQueued?: boolean };
+    expect(body2.alreadyQueued).toBe(true);
+    const q2 = (await (await fetch(`${base}/queue`)).json()) as { depth: number };
+    expect(q2.depth).toBe(1); // no duplicate
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('verifier_interval parsed from principles.md', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-008-rules-'));
+    writeFileSync(join(dir, 'principles.md'), `verifier:\n  interval_minutes: 30\n`);
+    const rules = loadRules(dir);
+    expect(rules.verifier).toEqual({ interval_minutes: 30 });
+  });
+
+  it('verifier_interval defaults to 60 when not specified', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-008-rules-default-'));
+    writeFileSync(join(dir, 'principles.md'), `blacklist: []\n`);
+    const rules = loadRules(dir);
+    expect(rules.verifier).toEqual({ interval_minutes: 60 });
   });
 });

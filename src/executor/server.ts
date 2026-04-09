@@ -10,6 +10,8 @@ import type { Rules } from '../rules.js';
 import { rankCandidates, type RankInput } from '../ranker.js';
 import { createGmailSubAgent, type GmailSubAgent } from '../gmail/subagent.js';
 import { clusterCandidates, type TriagedCandidate } from '../batcher.js';
+import { detectAnomalies } from '../verifier.js';
+import { readJournal } from '../journal.js';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -68,6 +70,55 @@ export function createExecutorServer(deps: ServerDeps): Server {
   const queuedMessageIds = new Set<string>();
   let refilling = false;
   const gmailSubAgent = createGmailSubAgent(deps.gmail);
+  /** Track goal IDs already surfaced as meta-cards to avoid duplicates. */
+  const metaCardGoalIds = new Set<string>();
+  let verifierTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Run the post-hoc verifier: detect anomalies and insert meta-cards. */
+  async function runVerifier(): Promise<void> {
+    const anomalies = await detectAnomalies(deps.journalPath, deps.gmail);
+    for (const a of anomalies) {
+      const metaId = `meta-${a.goalId}-${a.messageId}`;
+      if (metaCardGoalIds.has(metaId)) continue;
+      // Check if this meta-card goal ID is already in the queue
+      if (queue.some((c) => c.goal.id === metaId)) continue;
+      const msg = deps.gmail.getById(a.messageId);
+      if (!msg) continue;
+      const metaGoal: Goal = {
+        id: metaId,
+        title: a.type === 'unarchive'
+          ? `Review: "${msg.subject}" was unarchived`
+          : `Review: reply after archiving "${msg.subject}"`,
+        reason: a.description,
+        messageId: a.messageId,
+      };
+      const metaCard: CardState = {
+        goal: metaGoal,
+        message: msg,
+        features: { deadline: null, amount: null, waiting_on_user: false, category: 'meta', urgency: 'medium' as const },
+      };
+      queue.push(metaCard);
+      metaCardGoalIds.add(metaId);
+      // Journal the anomaly to prevent re-detection
+      appendJournal(deps.journalPath, {
+        kind: 'verifier_anomaly',
+        goalId: a.goalId,
+        messageId: a.messageId,
+        anomalyType: a.type,
+        metaCardId: metaId,
+      });
+    }
+  }
+
+  function startVerifierCron(): void {
+    const intervalMs = deps.getRules().verifier.interval_minutes * 60 * 1000;
+    if (verifierTimer) clearInterval(verifierTimer);
+    verifierTimer = setInterval(() => { runVerifier().catch(() => {}); }, intervalMs);
+  }
+
+  function stopVerifierCron(): void {
+    if (verifierTimer) { clearInterval(verifierTimer); verifierTimer = null; }
+  }
 
   async function triageAndPlan(message: GmailMessage): Promise<CardState> {
     // Stage 1: Triage (cheap model) — sees full message
@@ -391,6 +442,64 @@ export function createExecutorServer(deps: ServerDeps): Server {
         send(res, 200, JSON.stringify({ ok: true }));
         return;
       }
+      // GET /activity — list recent action journal entries
+      if (req.method === 'GET' && url === '/activity') {
+        const entries = readJournal(deps.journalPath);
+        const actions = entries.filter((e) => e.kind === 'action' || e.kind === 'verifier_anomaly');
+        // Most recent first, capped at 50
+        const recent = actions.reverse().slice(0, 50);
+        send(res, 200, JSON.stringify({ entries: recent }));
+        return;
+      }
+
+      // POST /activity/:goalId/wrong — user marks an action as wrong, emits a meta-card
+      const wrongMatch = url.match(/^\/activity\/([^/]+)\/wrong$/);
+      if (req.method === 'POST' && wrongMatch) {
+        const goalId = decodeURIComponent(wrongMatch[1]);
+        const entries = readJournal(deps.journalPath);
+        const action = entries.find((e) => e.kind === 'action' && e.goalId === goalId);
+        if (!action) {
+          send(res, 404, JSON.stringify({ error: 'action not found' }));
+          return;
+        }
+        const msgId = action.messageId as string;
+        const metaId = `meta-wrong-${goalId}`;
+        if (metaCardGoalIds.has(metaId) || queue.some((c) => c.goal.id === metaId)) {
+          send(res, 200, JSON.stringify({ ok: true, alreadyQueued: true }));
+          return;
+        }
+        const msg = deps.gmail.getById(msgId);
+        const metaGoal: Goal = {
+          id: metaId,
+          title: `Review: user flagged "${action.title}" as wrong`,
+          reason: `The user indicated this action was incorrect. Original goal: ${action.title}`,
+          messageId: msgId,
+        };
+        const metaCard: CardState = {
+          goal: metaGoal,
+          message: msg ?? { id: msgId, from: 'unknown', subject: String(action.title ?? ''), body: '', unread: false },
+          features: { deadline: null, amount: null, waiting_on_user: false, category: 'meta', urgency: 'high' as const },
+        };
+        queue.push(metaCard);
+        metaCardGoalIds.add(metaId);
+        appendJournal(deps.journalPath, {
+          kind: 'verifier_anomaly',
+          goalId,
+          messageId: msgId,
+          anomalyType: 'user_flagged_wrong',
+          metaCardId: metaId,
+        });
+        send(res, 200, JSON.stringify({ ok: true, metaCardId: metaId }));
+        return;
+      }
+
+      // POST /verifier/run — manually trigger the verifier (for tests and debugging)
+      if (req.method === 'POST' && url === '/verifier/run') {
+        await runVerifier();
+        send(res, 200, JSON.stringify({ ok: true, queueDepth: queue.length }));
+        return;
+      }
+
       send(res, 404, JSON.stringify({ error: 'not found' }));
     } catch (err) {
       send(res, 500, JSON.stringify({ error: (err as Error).message }));

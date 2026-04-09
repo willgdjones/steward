@@ -2,6 +2,14 @@
 
 ## 2026-04-09
 
+### Slice 008 — post-hoc verifier meta-cards
+- Post-hoc verifier detects anomalies in recently executed actions: user-unarchive (message archived by agent but unarchived by user) and reply-after-archive (new unread message from same sender with matching subject).
+- `src/verifier.ts` (NEW): `detectAnomalies()` reads the journal for `kind: 'action'` entries, checks Gmail state for each archived message, returns typed `Anomaly[]`. Deduplicates via `kind: 'verifier_anomaly'` journal entries.
+- `src/journal.ts`: added `readJournal()` to parse JSONL entries for the verifier.
+- `src/rules.ts`: added `VerifierConfig` type with `interval_minutes` (default 60, configurable in `principles.md`).
+- `src/executor/server.ts`: verifier cron runs on configurable interval. `POST /verifier/run` for manual trigger. Anomalies become meta-cards (category: 'meta') inserted into the queue. `GET /activity` returns recent action + anomaly entries. `POST /activity/:goalId/wrong` lets users flag actions as incorrect, emitting a meta-card.
+- 82 tests across 10 files; 12 new tests covering anomaly detection, meta-card insertion, deduplication, activity view, wrong button, and verifier config parsing.
+
 ### Slice 007 — batched action card
 - Collapse N similar archive goals into a single batched-action card. Clusters messages by (sender domain, category) and produces a batched card when ≥`batch_threshold` similar candidates exist.
 - `src/batcher.ts` (NEW): `clusterCandidates()` groups triaged candidates by domain+category, returns batches meeting threshold alongside unclustered remainder.
