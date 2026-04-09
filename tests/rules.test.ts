@@ -33,10 +33,41 @@ redaction:
     expect(rules.redaction[1]).toMatchObject({ field: 'subject', pattern: '\\d{4}[- ]?\\d{4}' });
   });
 
+  it('loads queue config, urgent_senders, and floor from principles.md', () => {
+    writeFileSync(
+      join(dir, 'principles.md'),
+      `queue:
+  target_depth: 7
+  low_water_mark: 3
+
+urgent_senders:
+  - boss@company.com
+  - CEO@company.com
+
+floor:
+  - match:
+      deadline_within_hours: 72
+    slots: 2
+  - match:
+      category: work
+    slots: 1
+`,
+    );
+    const rules = loadRules(dir);
+    expect(rules.queue).toEqual({ target_depth: 7, low_water_mark: 3 });
+    expect(rules.urgent_senders).toEqual(['boss@company.com', 'ceo@company.com']);
+    expect(rules.floor).toHaveLength(2);
+    expect(rules.floor[0]).toEqual({ match: { deadline_within_hours: 72 }, slots: 2 });
+    expect(rules.floor[1]).toEqual({ match: { category: 'work' }, slots: 1 });
+  });
+
   it('returns empty rules when files do not exist', () => {
     const rules = loadRules(dir);
     expect(rules.blacklist).toEqual([]);
     expect(rules.redaction).toEqual([]);
+    expect(rules.queue).toEqual({ target_depth: 5, low_water_mark: 2 });
+    expect(rules.urgent_senders).toEqual([]);
+    expect(rules.floor).toEqual([]);
   });
 
   it('returns empty rules when files are empty', () => {

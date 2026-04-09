@@ -4,13 +4,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { FakeGmail } from '../src/gmail/fake.js';
-import { createExecutorServer } from '../src/executor/server.js';
+import { createExecutorServer, type ServerDeps } from '../src/executor/server.js';
 import { planGoal, type PlannerInput } from '../src/planner/index.js';
 import { sanitiseEnvForPlanner } from '../src/executor/plannerClient.js';
 import { redact } from '../src/redactor.js';
 import { loadRules, type Rules } from '../src/rules.js';
 
-const EMPTY_RULES: Rules = { blacklist: [], redaction: [] };
+const EMPTY_RULES: Rules = {
+  blacklist: [],
+  redaction: [],
+  queue: { target_depth: 5, low_water_mark: 2 },
+  urgent_senders: [],
+  floor: [],
+};
 
 /** Adapter: wraps the trivial planGoal for the new PlannerInput signature. */
 const trivialPlan = async (input: PlannerInput) => planGoal(input.message);
@@ -145,6 +151,9 @@ describe('slice 003 principles gate + redactor rules', () => {
     const rules: Rules = {
       blacklist: [{ transport: 'gmail', action: 'archive' }],
       redaction: [],
+      queue: { target_depth: 5, low_water_mark: 2 },
+      urgent_senders: [],
+      floor: [],
     };
 
     const server = createExecutorServer({
@@ -196,6 +205,9 @@ describe('slice 003 principles gate + redactor rules', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [{ field: 'subject', pattern: '\\d{4}-\\d{4}' }],
+      queue: { target_depth: 5, low_water_mark: 2 },
+      urgent_senders: [],
+      floor: [],
     };
 
     // Capture what the planner receives
@@ -323,6 +335,9 @@ describe('slice 004 two-stage pipeline', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [{ field: 'subject', pattern: '\\d{8}' }],
+      queue: { target_depth: 5, low_water_mark: 2 },
+      urgent_senders: [],
+      floor: [],
     };
 
     let plannerInput: PlannerInput | null = null;
@@ -404,5 +419,240 @@ describe('slice 004 two-stage pipeline', () => {
     expect(plannerInput!.snippet).toBe('No triage available.');
 
     await new Promise<void>((r) => server.close(() => r()));
+  });
+});
+
+describe('slice 005 queue with deterministic floor', () => {
+  function makeMessages(count: number) {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `m${i}`,
+      from: `user${i}@example.com`,
+      subject: `msg ${i}`,
+      body: `body ${i}`,
+      unread: true,
+    }));
+  }
+
+  function makeQueueRules(overrides: Partial<Rules> = {}): Rules {
+    return {
+      blacklist: [],
+      redaction: [],
+      queue: { target_depth: 3, low_water_mark: 1 },
+      urgent_senders: [],
+      floor: [],
+      ...overrides,
+    };
+  }
+
+  async function startServer(
+    dir: string,
+    messages: Array<{ id: string; from: string; subject: string; body: string; unread: boolean }>,
+    rules: Rules,
+    opts: { triage?: ServerDeps['triage'] } = {},
+  ) {
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save(messages);
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+      triage: opts.triage,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    return { server, url: `http://127.0.0.1:${port}`, gmail };
+  }
+
+  async function stopServer(server: ReturnType<typeof createExecutorServer>) {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+
+  it('fills queue up to target_depth on first request', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-005-'));
+    const rules = makeQueueRules({ queue: { target_depth: 3, low_water_mark: 1 } });
+    const { server, url } = await startServer(dir, makeMessages(5), rules);
+
+    const res = await fetch(`${url}/card`);
+    expect(res.status).toBe(200);
+
+    const queueRes = await fetch(`${url}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: unknown[] };
+    expect(q.depth).toBe(3);
+    expect(q.depth).toBeLessThanOrEqual(rules.queue.target_depth);
+
+    await stopServer(server);
+  });
+
+  it('queue size never exceeds target_depth', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-005-cap-'));
+    const rules = makeQueueRules({ queue: { target_depth: 2, low_water_mark: 1 } });
+    const { server, url } = await startServer(dir, makeMessages(10), rules);
+
+    await fetch(`${url}/card`);
+    const queueRes = await fetch(`${url}/queue`);
+    const q = (await queueRes.json()) as { depth: number };
+    expect(q.depth).toBeLessThanOrEqual(2);
+
+    await stopServer(server);
+  });
+
+  it('refills when queue drops below low_water_mark', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-005-refill-'));
+    const rules = makeQueueRules({ queue: { target_depth: 3, low_water_mark: 2 } });
+    const { server, url } = await startServer(dir, makeMessages(6), rules);
+
+    // Initial fill
+    const cardRes = await fetch(`${url}/card`);
+    expect(cardRes.status).toBe(200);
+    const goal = (await cardRes.json()) as { id: string };
+
+    // Queue should be at target_depth (3)
+    let q = (await (await fetch(`${url}/queue`)).json()) as { depth: number };
+    expect(q.depth).toBe(3);
+
+    // Approve two cards to drop below low_water (3 → 2 → 1)
+    await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+
+    // Get next card and approve it
+    const card2Res = await fetch(`${url}/card`);
+    const goal2 = (await card2Res.json()) as { id: string };
+    await fetch(`${url}/card/${goal2.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+
+    // Now queue is at 1, below low_water_mark=2. Next GET /card should trigger refill.
+    await fetch(`${url}/card`);
+    q = (await (await fetch(`${url}/queue`)).json()) as { depth: number };
+    expect(q.depth).toBeGreaterThanOrEqual(2);
+    expect(q.depth).toBeLessThanOrEqual(3);
+
+    await stopServer(server);
+  });
+
+  it('manual refill via POST /refill works', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-005-manual-'));
+    // low_water_mark = target_depth so no auto-refill at 0
+    const rules = makeQueueRules({ queue: { target_depth: 3, low_water_mark: 0 } });
+    const { server, url } = await startServer(dir, makeMessages(5), rules);
+
+    // No auto-refill because low_water_mark=0 means queue.length (0) >= 0
+    // Actually low_water_mark=0 means it always refills. Let me use a different approach.
+    // Start with an empty inbox, then add messages and force refill.
+    await stopServer(server);
+
+    const dir2 = mkdtempSync(join(tmpdir(), 'steward-005-manual2-'));
+    const rules2 = makeQueueRules({ queue: { target_depth: 3, low_water_mark: 3 } });
+    const { server: s2, url: u2, gmail } = await startServer(dir2, [], rules2);
+
+    // Empty queue
+    const emptyRes = await fetch(`${u2}/card`);
+    expect(emptyRes.status).toBe(204);
+
+    // Add messages and force refill
+    gmail.save(makeMessages(5));
+    const refillRes = await fetch(`${u2}/refill`, { method: 'POST' });
+    expect(refillRes.status).toBe(200);
+    const refillBody = (await refillRes.json()) as { ok: boolean; depth: number };
+    expect(refillBody.ok).toBe(true);
+    expect(refillBody.depth).toBe(3);
+
+    await stopServer(s2);
+  });
+
+  it('urgent senders bypass queue and surface immediately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-005-urgent-'));
+    const rules = makeQueueRules({
+      queue: { target_depth: 3, low_water_mark: 1 },
+      urgent_senders: ['boss@important.com'],
+    });
+    const messages = [
+      { id: 'm0', from: 'normal@example.com', subject: 'normal', body: 'b', unread: true },
+      { id: 'm1', from: 'normal2@example.com', subject: 'normal2', body: 'b', unread: true },
+      { id: 'urgent', from: 'boss@important.com', subject: 'urgent', body: 'b', unread: true },
+      { id: 'm3', from: 'normal3@example.com', subject: 'normal3', body: 'b', unread: true },
+    ];
+    const { server, url } = await startServer(dir, messages, rules);
+
+    const cardRes = await fetch(`${url}/card`);
+    expect(cardRes.status).toBe(200);
+    const goal = (await cardRes.json()) as { id: string; messageId: string };
+    // Urgent sender should be the first card
+    expect(goal.messageId).toBe('urgent');
+
+    await stopServer(server);
+  });
+
+  it('floor reservations are honoured before tiebreaker', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-005-floor-'));
+    const now = new Date('2026-04-09T12:00:00Z');
+    const rules = makeQueueRules({
+      queue: { target_depth: 3, low_water_mark: 1 },
+      floor: [{ match: { deadline_within_hours: 72 }, slots: 1 }],
+    });
+
+    const messages = [
+      { id: 'high', from: 'a@test.com', subject: 'high urgency', body: 'b', unread: true },
+      { id: 'deadline', from: 'b@test.com', subject: 'has deadline', body: 'b', unread: true },
+      { id: 'low', from: 'c@test.com', subject: 'low urgency', body: 'b', unread: true },
+    ];
+
+    // Triage returns: high urgency for first, low urgency with deadline for second, low for third
+    const triageMap: Record<string, import('../src/triage.js').TriageResult> = {
+      high: {
+        features: { deadline: null, amount: null, waiting_on_user: false, category: 'work', urgency: 'high' },
+        snippet: 'high urgency task',
+      },
+      deadline: {
+        features: { deadline: '2026-04-10T12:00:00Z', amount: null, waiting_on_user: false, category: 'other', urgency: 'low' },
+        snippet: 'task with deadline',
+      },
+      low: {
+        features: { deadline: null, amount: null, waiting_on_user: false, category: 'other', urgency: 'low' },
+        snippet: 'low urgency',
+      },
+    };
+
+    const { server, url } = await startServer(dir, messages, rules, {
+      triage: async (msg) => triageMap[msg.id],
+    });
+
+    const cardRes = await fetch(`${url}/card`);
+    expect(cardRes.status).toBe(200);
+
+    // Check queue order
+    const queueRes = await fetch(`${url}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ messageId: string }> };
+    expect(q.depth).toBe(3);
+
+    // First card should be the deadline one (floor reservation)
+    expect(q.cards[0].messageId).toBe('deadline');
+    // Then high urgency (tiebreaker)
+    expect(q.cards[1].messageId).toBe('high');
+
+    await stopServer(server);
+  });
+
+  it('does not duplicate messages in the queue', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-005-dedup-'));
+    const rules = makeQueueRules({ queue: { target_depth: 5, low_water_mark: 3 } });
+    const { server, url } = await startServer(dir, makeMessages(3), rules);
+
+    // Fetch card twice — should not duplicate
+    await fetch(`${url}/card`);
+    await fetch(`${url}/card`);
+
+    const queueRes = await fetch(`${url}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ messageId: string }> };
+    const ids = q.cards.map((c) => c.messageId);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    await stopServer(server);
   });
 });

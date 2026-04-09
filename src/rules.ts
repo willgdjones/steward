@@ -13,12 +13,35 @@ export interface RedactionRule {
   pattern?: string;
 }
 
+export interface FloorReservation {
+  /** Match condition, e.g. { deadline_within_hours: 72 } */
+  match: Record<string, unknown>;
+  /** Number of queue slots to reserve for matching candidates. */
+  slots: number;
+}
+
+export interface QueueConfig {
+  target_depth: number;
+  low_water_mark: number;
+}
+
 export interface Rules {
   blacklist: BlacklistEntry[];
   redaction: RedactionRule[];
+  queue: QueueConfig;
+  urgent_senders: string[];
+  floor: FloorReservation[];
 }
 
-const EMPTY_RULES: Rules = { blacklist: [], redaction: [] };
+const DEFAULT_QUEUE: QueueConfig = { target_depth: 5, low_water_mark: 2 };
+
+const EMPTY_RULES: Rules = {
+  blacklist: [],
+  redaction: [],
+  queue: { ...DEFAULT_QUEUE },
+  urgent_senders: [],
+  floor: [],
+};
 
 function loadFile(path: string): Record<string, unknown> | null {
   if (!existsSync(path)) return null;
@@ -49,7 +72,24 @@ export function loadRules(dir: string): Rules {
       })
     : [];
 
-  return { blacklist, redaction };
+  const queueRaw = principles.queue as Record<string, unknown> | undefined;
+  const queue: QueueConfig = {
+    target_depth: typeof queueRaw?.target_depth === 'number' ? queueRaw.target_depth : DEFAULT_QUEUE.target_depth,
+    low_water_mark: typeof queueRaw?.low_water_mark === 'number' ? queueRaw.low_water_mark : DEFAULT_QUEUE.low_water_mark,
+  };
+
+  const urgent_senders: string[] = Array.isArray(principles.urgent_senders)
+    ? (principles.urgent_senders as string[]).map((s) => s.toLowerCase())
+    : [];
+
+  const floor: FloorReservation[] = Array.isArray(principles.floor)
+    ? (principles.floor as Array<Record<string, unknown>>).map((e) => ({
+        match: (e.match ?? {}) as Record<string, unknown>,
+        slots: typeof e.slots === 'number' ? e.slots : 1,
+      }))
+    : [];
+
+  return { blacklist, redaction, queue, urgent_senders, floor };
 }
 
 export function watchRules(

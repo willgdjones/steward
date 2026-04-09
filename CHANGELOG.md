@@ -2,6 +2,13 @@
 
 ## 2026-04-09
 
+### Slice 005 — queue with deterministic floor
+- Promoted single-card flow to a real queue with configurable `target_depth` and `low_water_mark` in `principles.md`.
+- `src/ranker.ts` (NEW): deterministic floor reservations (e.g. "always 2 slots for items with deadline <72h"), then urgency tiebreaker for remaining slots. Queue size structurally capped at `target_depth`.
+- `src/rules.ts`: extended `Rules` type with `QueueConfig`, `urgent_senders`, and `FloorReservation[]`. Parsed from `principles.md` YAML with sensible defaults (target_depth=5, low_water_mark=2).
+- `src/executor/server.ts`: refactored from `current: CardState | null` to `queue: CardState[]`. Refill logic triages all candidates, ranks them via the ranker, and fills up to `target_depth`. Low-water trigger on `GET /card`. Urgent senders bypass ranking and insert at front. `GET /queue` endpoint for queue inspection. `POST /refill` for manual refill.
+- 49 tests across 7 files; 8 new tests for queue depth, refill, urgent senders, floor reservations, deduplication, and rules parsing.
+
 ### Slice 004 — frontier triage in the loop
 - Two-stage pipeline: cheap model (Haiku) extracts structured features from full message, expensive model (Sonnet/Opus) produces real goals from redacted slice + features.
 - `src/triage.ts`: `TriageFeatures` type (deadline, amount, waiting_on_user, category, urgency), `createTriage()` factory backed by Anthropic SDK, `defaultTriageResult()` fallback.
