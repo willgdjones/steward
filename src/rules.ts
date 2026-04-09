@@ -25,6 +25,8 @@ export interface QueueConfig {
   low_water_mark: number;
   /** Minimum cluster size to trigger a batched card. Defaults to 3. */
   batch_threshold: number;
+  /** Number of queue positions reserved for exploration (high-uncertainty candidates). Defaults to 1. */
+  exploration_slots: number;
 }
 
 export interface ReversibilityDecl {
@@ -57,7 +59,7 @@ export interface Rules {
   promotion: PromotionConfig;
 }
 
-const DEFAULT_QUEUE: QueueConfig = { target_depth: 5, low_water_mark: 2, batch_threshold: 3 };
+const DEFAULT_QUEUE: QueueConfig = { target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 1 };
 
 const DEFAULT_VERIFIER: VerifierConfig = { interval_minutes: 60 };
 
@@ -108,6 +110,7 @@ export function loadRules(dir: string): Rules {
     target_depth: typeof queueRaw?.target_depth === 'number' ? queueRaw.target_depth : DEFAULT_QUEUE.target_depth,
     low_water_mark: typeof queueRaw?.low_water_mark === 'number' ? queueRaw.low_water_mark : DEFAULT_QUEUE.low_water_mark,
     batch_threshold: typeof queueRaw?.batch_threshold === 'number' ? queueRaw.batch_threshold : DEFAULT_QUEUE.batch_threshold,
+    exploration_slots: typeof queueRaw?.exploration_slots === 'number' ? queueRaw.exploration_slots : DEFAULT_QUEUE.exploration_slots,
   };
 
   const urgent_senders: string[] = Array.isArray(principles.urgent_senders)

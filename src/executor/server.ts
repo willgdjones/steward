@@ -9,7 +9,7 @@ import { defaultTriageResult } from '../triage.js';
 import { appendJournal } from '../journal.js';
 import { checkBlacklist } from '../principlesGate.js';
 import type { Rules } from '../rules.js';
-import { rankCandidates, type RankInput } from '../ranker.js';
+import { rankCandidates, learnWeights, type RankInput } from '../ranker.js';
 import { createGmailSubAgent, type GmailSubAgent } from '../gmail/subagent.js';
 import { clusterCandidates, type TriagedCandidate } from '../batcher.js';
 import { detectAnomalies } from '../verifier.js';
@@ -39,6 +39,10 @@ interface CardState {
   features: import('../triage.js').TriageFeatures;
   /** For batched cards, all messages in the batch. */
   batchMessages?: GmailMessage[];
+  /** Per-feature score breakdown from the ranker. */
+  breakdown?: import('../ranker.js').ScoreBreakdown;
+  /** Whether this card fills an exploration slot. */
+  exploration?: boolean;
 }
 
 const WEB_CLIENT_HTML = `<!doctype html>
@@ -280,13 +284,19 @@ export function createExecutorServer(deps: ServerDeps): Server {
         }
       }
 
-      // Rank remaining (non-batched) candidates
+      // Learn weights from swipe history and rank remaining candidates
+      const journalEntries = readJournal(deps.journalPath);
+      const learnedWeights = learnWeights(journalEntries);
       const rankInputs: RankInput[] = remaining.map((t) => ({
         messageId: t.message.id,
         features: t.result.features,
       }));
       const slotsAvailable = target_depth - queue.length;
-      const ranked = rankCandidates(rankInputs, rules.floor, slotsAvailable);
+      const ranked = rankCandidates(rankInputs, rules.floor, slotsAvailable, undefined, {
+        weights: learnedWeights,
+        explorationSlots: rules.queue.exploration_slots,
+        journalEntries,
+      });
 
       // Build a lookup for triaged data
       const triagedMap = new Map(triaged.map((t) => [t.message.id, t]));
@@ -318,6 +328,8 @@ export function createExecutorServer(deps: ServerDeps): Server {
         if (queuedMessageIds.has(r.messageId)) continue;
 
         const card = await planAndEnqueue(entry);
+        card.breakdown = r.breakdown;
+        card.exploration = r.exploration;
         queue.push(card);
         queuedMessageIds.add(entry.message.id);
       }
@@ -360,7 +372,11 @@ export function createExecutorServer(deps: ServerDeps): Server {
       if (req.method === 'GET' && url === '/queue') {
         send(res, 200, JSON.stringify({
           depth: queue.length,
-          cards: queue.map((c) => c.goal),
+          cards: queue.map((c) => ({
+            ...c.goal,
+            breakdown: c.breakdown,
+            exploration: c.exploration,
+          })),
         }));
         return;
       }
@@ -510,6 +526,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
           goalId: card.goal.id,
           messageId: card.message.id,
           title: card.goal.title,
+          features: card.features,
         });
         queue.splice(idx, 1);
         if (card.batchMessages) {

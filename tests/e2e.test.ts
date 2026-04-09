@@ -14,7 +14,7 @@ import type { JournalEntry } from '../src/journal.js';
 const EMPTY_RULES: Rules = {
   blacklist: [],
   redaction: [],
-  queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 999 },
+  queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 999, exploration_slots: 0 },
   urgent_senders: [],
   floor: [],
   reversibility: [],
@@ -158,7 +158,7 @@ describe('slice 003 principles gate + redactor rules', () => {
     const rules: Rules = {
       blacklist: [{ transport: 'gmail', action: 'archive' }],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 0 },
       urgent_senders: [],
       floor: [],
       reversibility: [],
@@ -215,7 +215,7 @@ describe('slice 003 principles gate + redactor rules', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [{ field: 'subject', pattern: '\\d{4}-\\d{4}' }],
-      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 0 },
       urgent_senders: [],
       floor: [],
       reversibility: [],
@@ -348,7 +348,7 @@ describe('slice 004 two-stage pipeline', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [{ field: 'subject', pattern: '\\d{8}' }],
-      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 0 },
       urgent_senders: [],
       floor: [],
       reversibility: [],
@@ -450,7 +450,7 @@ describe('slice 005 queue with deterministic floor', () => {
   }
 
   function makeQueueRules(overrides: Omit<Partial<Rules>, 'queue'> & { queue?: Partial<import('../src/rules.js').QueueConfig> } = {}): Rules {
-    const defaultQueue = { target_depth: 3, low_water_mark: 1, batch_threshold: 999 };
+    const defaultQueue = { target_depth: 3, low_water_mark: 1, batch_threshold: 999, exploration_slots: 0 };
     const { queue: queueOverrides, ...rest } = overrides;
     return {
       blacklist: [],
@@ -590,7 +590,7 @@ describe('slice 005 queue with deterministic floor', () => {
   it('urgent senders bypass queue and surface immediately', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'steward-005-urgent-'));
     const rules = makeQueueRules({
-      queue: { target_depth: 3, low_water_mark: 1, batch_threshold: 999 },
+      queue: { target_depth: 3, low_water_mark: 1, batch_threshold: 999, exploration_slots: 0 },
       urgent_senders: ['boss@important.com'],
     });
     const messages = [
@@ -614,7 +614,7 @@ describe('slice 005 queue with deterministic floor', () => {
     const dir = mkdtempSync(join(tmpdir(), 'steward-005-floor-'));
     const now = new Date('2026-04-09T12:00:00Z');
     const rules = makeQueueRules({
-      queue: { target_depth: 3, low_water_mark: 1, batch_threshold: 999 },
+      queue: { target_depth: 3, low_water_mark: 1, batch_threshold: 999, exploration_slots: 0 },
       floor: [{ match: { deadline_within_hours: 72 }, slots: 1 }],
     });
 
@@ -689,7 +689,7 @@ describe('slice 006 archive via sub-agent', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 0 },
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
@@ -753,7 +753,7 @@ describe('slice 006 archive via sub-agent', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 0 },
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
@@ -804,7 +804,7 @@ describe('slice 006 archive via sub-agent', () => {
     const rules: Rules = {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3 },
+      queue: { target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 0 },
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
@@ -866,6 +866,7 @@ describe('slice 007 batched action card', () => {
         target_depth: overrides.target_depth ?? 10,
         low_water_mark: 1,
         batch_threshold: overrides.batch_threshold ?? 3,
+        exploration_slots: 0,
       },
       urgent_senders: [],
       floor: [],
@@ -1292,7 +1293,7 @@ describe('slice 009 rule promotion meta-cards', () => {
     return {
       blacklist: [],
       redaction: [],
-      queue: { target_depth: 10, low_water_mark: 1, batch_threshold: 999 },
+      queue: { target_depth: 10, low_water_mark: 1, batch_threshold: 999, exploration_slots: 0 },
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
@@ -1521,5 +1522,259 @@ describe('slice 009 rule promotion meta-cards', () => {
     writeFileSync(join(dir, 'principles.md'), `blacklist: []\n`);
     const rules = loadRules(dir);
     expect(rules.promotion).toEqual({ threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 });
+  });
+});
+
+describe('slice 010 learned ranker with exploration', () => {
+  function makeRankerRules(overrides: Partial<{ exploration_slots: number; target_depth: number }> = {}): Rules {
+    return {
+      blacklist: [],
+      redaction: [],
+      queue: {
+        target_depth: overrides.target_depth ?? 5,
+        low_water_mark: 1,
+        batch_threshold: 999,
+        exploration_slots: overrides.exploration_slots ?? 1,
+      },
+      urgent_senders: [],
+      floor: [],
+      reversibility: [{ action: 'archive', reversible: true }],
+      verifier: { interval_minutes: 60 },
+      promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
+    };
+  }
+
+  it('decision journal entries include features for weight learning', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-010-features-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const rules = makeRankerRules({ exploration_slots: 0 });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+
+    // Defer instead of approve (so it hits the generic decision path)
+    await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'defer' }),
+    });
+
+    const journal = readFileSync(journalPath, 'utf8').trim().split('\n');
+    const entry = JSON.parse(journal[0]) as JournalEntry;
+    expect(entry.kind).toBe('decision');
+    expect(entry.features).toBeDefined();
+    expect((entry.features as Record<string, unknown>).urgency).toBeDefined();
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('/queue exposes per-card feature breakdown', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-010-breakdown-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+    const rules = makeRankerRules({ exploration_slots: 0 });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // Trigger refill
+    await fetch(`${base}/refill`, { method: 'POST' });
+
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ id: string; breakdown?: Record<string, number> }> };
+    expect(q.depth).toBeGreaterThanOrEqual(1);
+    const card = q.cards[0];
+    expect(card.breakdown).toBeDefined();
+    expect(card.breakdown!.total).toBeDefined();
+    expect(card.breakdown!.urgency).toBeDefined();
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('exploration slots reserve positions for high-uncertainty candidates', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-010-explore-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    // Create several messages
+    gmail.save([
+      { id: 'm1', from: 'known@example.com', subject: 'msg1', body: 'body', unread: true },
+      { id: 'm2', from: 'known@example.com', subject: 'msg2', body: 'body', unread: true },
+      { id: 'm3', from: 'unknown@newdomain.com', subject: 'msg3', body: 'body', unread: true },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+
+    // Seed journal with many decisions on m1 to give it low uncertainty
+    const { appendJournal: aj } = await import('../src/journal.js');
+    for (let i = 0; i < 5; i++) {
+      aj(journalPath, {
+        ts: new Date().toISOString(),
+        kind: 'decision',
+        decision: 'approve',
+        goalId: `g-${i}`,
+        messageId: 'm1',
+        features: { urgency: 'low', deadline: null, amount: null, waiting_on_user: false, category: 'other' },
+      });
+    }
+
+    const rules = makeRankerRules({ exploration_slots: 1, target_depth: 5 });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    await fetch(`${base}/refill`, { method: 'POST' });
+
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ id: string; exploration?: boolean }> };
+    // At least one card should be marked as exploration
+    const explorationCards = q.cards.filter((c) => c.exploration === true);
+    expect(explorationCards.length).toBeGreaterThanOrEqual(1);
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('learned weights from swipe history affect ranking order', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-010-weights-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    const journalPath = join(dir, 'journal.jsonl');
+
+    // Seed journal: many approvals for items with amounts
+    const { appendJournal: aj } = await import('../src/journal.js');
+    for (let i = 0; i < 20; i++) {
+      aj(journalPath, {
+        kind: 'decision',
+        decision: 'approve',
+        goalId: `g-${i}`,
+        messageId: `m-hist-${i}`,
+        features: { urgency: 'low', deadline: null, amount: '£100', waiting_on_user: false, category: 'transaction' },
+      });
+    }
+
+    // Now put two fresh messages: one with amount (low urgency), one without (medium urgency)
+    gmail.save([
+      { id: 'no-amount', from: 'alice@example.com', subject: 'no amount', body: 'body', unread: true },
+      { id: 'with-amount', from: 'bob@example.com', subject: 'has amount', body: 'body', unread: true },
+    ]);
+
+    // Custom triage: assign different features to each
+    const triage = async (msg: import('../src/gmail/fake.js').GmailMessage) => {
+      if (msg.id === 'with-amount') {
+        return {
+          features: { urgency: 'low' as const, deadline: null, amount: '£50', waiting_on_user: false, category: 'transaction' },
+          snippet: 'has amount',
+        };
+      }
+      return {
+        features: { urgency: 'medium' as const, deadline: null, amount: null, waiting_on_user: false, category: 'other' },
+        snippet: 'no amount',
+      };
+    };
+
+    const rules = makeRankerRules({ exploration_slots: 0, target_depth: 5 });
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      triage,
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    await fetch(`${base}/refill`, { method: 'POST' });
+
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ id: string; messageId: string }> };
+    // With learned weights boosting has_amount, with-amount should come first
+    expect(q.cards[0].id).toContain('with-amount');
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('floor reservations from slice 005 are still honoured with learned ranker', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-010-floor-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm-high', from: 'alice@example.com', subject: 'urgent', body: 'body', unread: true },
+      { id: 'm-deadline', from: 'bob@example.com', subject: 'deadline', body: 'body', unread: true },
+    ]);
+    const journalPath = join(dir, 'journal.jsonl');
+
+    // Custom triage
+    const triage = async (msg: import('../src/gmail/fake.js').GmailMessage) => {
+      if (msg.id === 'm-deadline') {
+        return {
+          features: { urgency: 'low' as const, deadline: '2026-04-10T00:00:00Z', amount: null, waiting_on_user: false, category: 'work' },
+          snippet: 'deadline item',
+        };
+      }
+      return {
+        features: { urgency: 'high' as const, deadline: null, amount: null, waiting_on_user: false, category: 'other' },
+        snippet: 'high urgency',
+      };
+    };
+
+    const rules: Rules = {
+      ...makeRankerRules({ exploration_slots: 0, target_depth: 5 }),
+      floor: [{ match: { deadline_within_hours: 72 }, slots: 1 }],
+    };
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath,
+      triage,
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    await fetch(`${base}/refill`, { method: 'POST' });
+
+    const queueRes = await fetch(`${base}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ id: string }> };
+    // Floor reservation should put deadline item first despite low urgency
+    expect(q.cards[0].id).toContain('m-deadline');
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('exploration_slots config parsed from principles.md', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-010-config-'));
+    writeFileSync(join(dir, 'principles.md'), `queue:\n  target_depth: 5\n  low_water_mark: 2\n  batch_threshold: 3\n  exploration_slots: 2\n`);
+    const rules = loadRules(dir);
+    expect(rules.queue.exploration_slots).toBe(2);
   });
 });

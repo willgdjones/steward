@@ -54,7 +54,7 @@ floor:
 `,
     );
     const rules = loadRules(dir);
-    expect(rules.queue).toEqual({ target_depth: 7, low_water_mark: 3, batch_threshold: 3 });
+    expect(rules.queue).toEqual({ target_depth: 7, low_water_mark: 3, batch_threshold: 3, exploration_slots: 1 });
     expect(rules.urgent_senders).toEqual(['boss@company.com', 'ceo@company.com']);
     expect(rules.floor).toHaveLength(2);
     expect(rules.floor[0]).toEqual({ match: { deadline_within_hours: 72 }, slots: 2 });
@@ -65,7 +65,7 @@ floor:
     const rules = loadRules(dir);
     expect(rules.blacklist).toEqual([]);
     expect(rules.redaction).toEqual([]);
-    expect(rules.queue).toEqual({ target_depth: 5, low_water_mark: 2, batch_threshold: 3 });
+    expect(rules.queue).toEqual({ target_depth: 5, low_water_mark: 2, batch_threshold: 3, exploration_slots: 1 });
     expect(rules.urgent_senders).toEqual([]);
     expect(rules.floor).toEqual([]);
   });

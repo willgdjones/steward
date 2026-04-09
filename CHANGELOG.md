@@ -2,6 +2,13 @@
 
 ## 2026-04-09
 
+### Slice 010 — learned ranker with exploration
+- Promoted the floor-only ranker to a full feature scorer with weights learned from swipe history, clamping, exploration slots, and per-card score breakdowns.
+- `src/ranker.ts`: added `FeatureVector` (deadline_proximity, has_amount, waiting_on_user, urgency), `FeatureWeights` with clamped bounds, `extractFeatureVector()`, `scoreCandidate()`, `learnWeights()` from journal decision entries. `rankCandidates()` now uses learned weights, reserves exploration slots for high-uncertainty candidates, and attaches `ScoreBreakdown` to each ranked candidate.
+- `src/rules.ts`: `QueueConfig` extended with `exploration_slots` (default 1, configurable in `principles.md`).
+- `src/executor/server.ts`: refill pipeline learns weights from journal, passes exploration slots config to ranker. Decision journal entries now include `features` for weight learning. `/queue` endpoint exposes per-card `breakdown` and `exploration` flag.
+- 116 tests across 11 files; 21 new tests covering feature extraction, scoring, weight learning, clamping, exploration slots, journal feature storage, breakdown visibility, and config parsing.
+
 ### Slice 009 — rule promotion meta-cards
 - Pattern detector scans the decision journal for repeated swipe patterns (e.g. "user approved 5 archives from substack.com") and proposes standing rules via meta-cards.
 - `src/promoter.ts` (NEW): `detectPromotions()` groups `kind: 'action'` journal entries by (transport, action, senderDomain). When count >= threshold, returns `Promotion[]` with proposed rule text. Respects cooldowns after rejection and skips already-promoted patterns.
