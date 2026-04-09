@@ -7,6 +7,7 @@ export interface GmailMessage {
   subject: string;
   body: string;
   unread: boolean;
+  archived?: boolean;
 }
 
 /**
@@ -36,10 +37,25 @@ export class FakeGmail {
 
   /**
    * Search messages by query string. For FakeGmail this just returns
-   * unread messages (the query is ignored). Real Gmail (issue 004+)
-   * will use the Gmail API search.
+   * unread messages that aren't archived (the query is ignored).
+   * Real Gmail (issue 004+) will use the Gmail API search.
    */
   search(_query: string): GmailMessage[] {
-    return this.load().filter((m) => m.unread);
+    return this.load().filter((m) => m.unread && !m.archived);
+  }
+
+  /** Look up a single message by ID. Returns null if not found. */
+  getById(id: string): GmailMessage | null {
+    return this.load().find((m) => m.id === id) ?? null;
+  }
+
+  /** Archive a message: sets archived=true. Returns true if the message was found. */
+  archive(id: string): boolean {
+    const messages = this.load();
+    const msg = messages.find((m) => m.id === id);
+    if (!msg) return false;
+    msg.archived = true;
+    this.save(messages);
+    return true;
   }
 }

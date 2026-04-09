@@ -25,12 +25,18 @@ export interface QueueConfig {
   low_water_mark: number;
 }
 
+export interface ReversibilityDecl {
+  action: string;
+  reversible: boolean;
+}
+
 export interface Rules {
   blacklist: BlacklistEntry[];
   redaction: RedactionRule[];
   queue: QueueConfig;
   urgent_senders: string[];
   floor: FloorReservation[];
+  reversibility: ReversibilityDecl[];
 }
 
 const DEFAULT_QUEUE: QueueConfig = { target_depth: 5, low_water_mark: 2 };
@@ -41,6 +47,7 @@ const EMPTY_RULES: Rules = {
   queue: { ...DEFAULT_QUEUE },
   urgent_senders: [],
   floor: [],
+  reversibility: [],
 };
 
 function loadFile(path: string): Record<string, unknown> | null {
@@ -89,7 +96,14 @@ export function loadRules(dir: string): Rules {
       }))
     : [];
 
-  return { blacklist, redaction, queue, urgent_senders, floor };
+  const reversibility: ReversibilityDecl[] = Array.isArray(principles.reversibility)
+    ? (principles.reversibility as Array<Record<string, unknown>>).map((e) => ({
+        action: String(e.action),
+        reversible: e.reversible === true,
+      }))
+    : [];
+
+  return { blacklist, redaction, queue, urgent_senders, floor, reversibility };
 }
 
 export function watchRules(

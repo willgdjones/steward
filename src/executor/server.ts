@@ -8,6 +8,7 @@ import { appendJournal } from '../journal.js';
 import { checkBlacklist } from '../principlesGate.js';
 import type { Rules } from '../rules.js';
 import { rankCandidates, type RankInput } from '../ranker.js';
+import { createGmailSubAgent, type GmailSubAgent } from '../gmail/subagent.js';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -63,6 +64,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
   /** Track message IDs already in the queue to avoid duplicates. */
   const queuedMessageIds = new Set<string>();
   let refilling = false;
+  const gmailSubAgent = createGmailSubAgent(deps.gmail);
 
   async function triageAndPlan(message: GmailMessage): Promise<CardState> {
     // Stage 1: Triage (cheap model) — sees full message
@@ -270,6 +272,31 @@ export function createExecutorServer(deps: ServerDeps): Server {
             return;
           }
         }
+        // If approving an actionable goal, dispatch to the sub-agent
+        if (decision === 'approve' && card.goal.action === 'archive' && card.goal.transport === 'gmail') {
+          const instruction = {
+            capability: card.goal.action,
+            messageId: card.message.id,
+            instruction: `Archive message "${card.goal.title}" (${card.message.subject})`,
+          };
+          const outcome = await gmailSubAgent.dispatch(instruction);
+          const verification = await gmailSubAgent.verify(card.message.id, card.goal.action);
+
+          appendJournal(deps.journalPath, {
+            kind: 'action',
+            goalId: card.goal.id,
+            messageId: card.message.id,
+            title: card.goal.title,
+            instruction,
+            outcome,
+            verification,
+          });
+          queue.splice(idx, 1);
+          queuedMessageIds.delete(card.message.id);
+          send(res, 200, JSON.stringify({ ok: true, outcome, verification }));
+          return;
+        }
+
         appendJournal(deps.journalPath, {
           kind: 'decision',
           decision,

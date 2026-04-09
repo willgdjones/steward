@@ -2,6 +2,14 @@
 
 ## 2026-04-09
 
+### Slice 006 — archive via Gmail sub-agent
+- First real action: approving an archive card dispatches to the Gmail sub-agent, archives the message, verifies the result, and journals the full flow.
+- `src/gmail/subagent.ts` (NEW): `GmailSubAgent` with `dispatch()` and `verify()` methods. Takes free-form `SubAgentInstruction`, returns structured `SubAgentOutcome`. Verification re-fetches the message and confirms archived state.
+- `src/gmail/fake.ts`: added `archived` field (optional), `getById()` for verification lookups, `archive()` method. `search()` now excludes archived messages.
+- `src/rules.ts`: added `ReversibilityDecl` type and `reversibility[]` to `Rules`. Parsed from `principles.md` YAML.
+- `src/executor/server.ts`: on approve of `gmail/archive`, dispatches to sub-agent → verifies → journals as `kind: 'action'` with instruction, outcome, and verification. Non-archive approvals still journal as `kind: 'decision'`.
+- 59 tests across 8 files; 10 new tests covering sub-agent dispatch, verification success/failure, archived message exclusion from queue, reversibility parsing, and full e2e flow.
+
 ### Slice 005 — queue with deterministic floor
 - Promoted single-card flow to a real queue with configurable `target_depth` and `low_water_mark` in `principles.md`.
 - `src/ranker.ts` (NEW): deterministic floor reservations (e.g. "always 2 slots for items with deadline <72h"), then urgency tiebreaker for remaining slots. Queue size structurally capped at `target_depth`.

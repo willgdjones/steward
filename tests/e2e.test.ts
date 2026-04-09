@@ -9,6 +9,7 @@ import { planGoal, type PlannerInput } from '../src/planner/index.js';
 import { sanitiseEnvForPlanner } from '../src/executor/plannerClient.js';
 import { redact } from '../src/redactor.js';
 import { loadRules, type Rules } from '../src/rules.js';
+import type { JournalEntry } from '../src/journal.js';
 
 const EMPTY_RULES: Rules = {
   blacklist: [],
@@ -16,6 +17,7 @@ const EMPTY_RULES: Rules = {
   queue: { target_depth: 5, low_water_mark: 2 },
   urgent_senders: [],
   floor: [],
+  reversibility: [],
 };
 
 /** Adapter: wraps the trivial planGoal for the new PlannerInput signature. */
@@ -71,12 +73,15 @@ describe('slice 002 end-to-end skeleton', () => {
     const lines = readFileSync(journalPath, 'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
     const entry = JSON.parse(lines[0]);
+    // Since the trivial planner produces action=archive, the executor
+    // dispatches to the sub-agent — journal kind is 'action', not 'decision'.
     expect(entry).toMatchObject({
-      kind: 'decision',
-      decision: 'approve',
+      kind: 'action',
       goalId: goal.id,
       messageId: 'm1',
     });
+    expect(entry.outcome).toMatchObject({ success: true, action_taken: 'archive' });
+    expect(entry.verification).toMatchObject({ verified: true });
   });
 
   it('serves the web client at /', async () => {
@@ -154,6 +159,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       queue: { target_depth: 5, low_water_mark: 2 },
       urgent_senders: [],
       floor: [],
+      reversibility: [],
     };
 
     const server = createExecutorServer({
@@ -208,6 +214,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       queue: { target_depth: 5, low_water_mark: 2 },
       urgent_senders: [],
       floor: [],
+      reversibility: [],
     };
 
     // Capture what the planner receives
@@ -338,6 +345,7 @@ describe('slice 004 two-stage pipeline', () => {
       queue: { target_depth: 5, low_water_mark: 2 },
       urgent_senders: [],
       floor: [],
+      reversibility: [],
     };
 
     let plannerInput: PlannerInput | null = null;
@@ -440,6 +448,7 @@ describe('slice 005 queue with deterministic floor', () => {
       queue: { target_depth: 3, low_water_mark: 1 },
       urgent_senders: [],
       floor: [],
+      reversibility: [],
       ...overrides,
     };
   }
@@ -654,5 +663,178 @@ describe('slice 005 queue with deterministic floor', () => {
     expect(new Set(ids).size).toBe(ids.length);
 
     await stopServer(server);
+  });
+});
+
+describe('slice 006 archive via sub-agent', () => {
+  it('approving an archive card dispatches to sub-agent, verifies, and journals the full flow', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-006-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'newsletter@substack.com', subject: 'Weekly digest', body: 'content', unread: true },
+    ]);
+
+    const rules: Rules = {
+      blacklist: [],
+      redaction: [],
+      queue: { target_depth: 5, low_water_mark: 2 },
+      urgent_senders: [],
+      floor: [],
+      reversibility: [{ action: 'archive', reversible: true }],
+    };
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // Get card
+    const cardRes = await fetch(`${base}/card`);
+    expect(cardRes.status).toBe(200);
+    const goal = (await cardRes.json()) as { id: string; action: string };
+    expect(goal.action).toBe('archive');
+
+    // Approve — should trigger sub-agent dispatch + verification
+    const decRes = await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(decRes.status).toBe(200);
+    const decBody = (await decRes.json()) as { ok: boolean; outcome: unknown; verification: unknown };
+    expect(decBody.ok).toBe(true);
+    expect(decBody.outcome).toMatchObject({ success: true, action_taken: 'archive' });
+    expect(decBody.verification).toMatchObject({ verified: true, actual_state: 'archived' });
+
+    // Verify the message is archived in FakeGmail
+    const msg = gmail.getById('m1');
+    expect(msg).not.toBeNull();
+    expect(msg!.archived).toBe(true);
+
+    // Journal should have goal, instruction, outcome, and verification
+    const lines = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
+    const entries = lines.map((l) => JSON.parse(l) as JournalEntry);
+    const actionEntry = entries.find((e) => e.kind === 'action');
+    expect(actionEntry).toBeDefined();
+    expect(actionEntry!.goalId).toBe(goal.id);
+    expect(actionEntry!.instruction).toBeDefined();
+    expect(actionEntry!.outcome).toMatchObject({ success: true });
+    expect(actionEntry!.verification).toMatchObject({ verified: true });
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('archive card no longer shows archived messages in the queue', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-006-noshow-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@test.com', subject: 'msg1', body: 'b', unread: true },
+    ]);
+
+    const rules: Rules = {
+      blacklist: [],
+      redaction: [],
+      queue: { target_depth: 5, low_water_mark: 2 },
+      urgent_senders: [],
+      floor: [],
+      reversibility: [{ action: 'archive', reversible: true }],
+    };
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    // Get and approve
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+
+    // Next card request should be empty (message is archived)
+    const nextRes = await fetch(`${base}/card`);
+    expect(nextRes.status).toBe(204);
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('verification failure is journalled when archive does not stick', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-006-verfail-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'a@test.com', subject: 'msg1', body: 'b', unread: true },
+    ]);
+
+    // Override archive to silently fail (simulate Gmail API failure)
+    const origArchive = gmail.archive.bind(gmail);
+    gmail.archive = (_id: string) => {
+      // Don't actually archive — simulates a failure
+      return true; // Returns true (found) but doesn't persist
+    };
+
+    const rules: Rules = {
+      blacklist: [],
+      redaction: [],
+      queue: { target_depth: 5, low_water_mark: 2 },
+      urgent_senders: [],
+      floor: [],
+      reversibility: [{ action: 'archive', reversible: true }],
+    };
+
+    const server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => rules,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${base}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const decRes = await fetch(`${base}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(decRes.status).toBe(200);
+    const body = (await decRes.json()) as { verification: { verified: boolean } };
+    expect(body.verification.verified).toBe(false);
+
+    // Journal should record the failed verification
+    const lines = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
+    const entries = lines.map((l) => JSON.parse(l) as JournalEntry);
+    const actionEntry = entries.find((e) => e.kind === 'action');
+    expect(actionEntry).toBeDefined();
+    expect(actionEntry!.verification).toMatchObject({ verified: false });
+
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('reversibility is parsed from principles.md', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-006-rev-'));
+    writeFileSync(
+      join(dir, 'principles.md'),
+      `reversibility:\n  - action: archive\n    reversible: true\n  - action: send\n    reversible: false\n`,
+    );
+    const rules = loadRules(dir);
+    expect(rules.reversibility).toEqual([
+      { action: 'archive', reversible: true },
+      { action: 'send', reversible: false },
+    ]);
   });
 });
