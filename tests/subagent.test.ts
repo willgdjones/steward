@@ -105,4 +105,59 @@ describe('Gmail sub-agent', () => {
     expect(results).toHaveLength(1);
     expect(results[0].id).toBe('m2');
   });
+
+  it('creates a draft reply and returns the draft ID', async () => {
+    const agent = createGmailSubAgent(gmail);
+    const outcome = await agent.dispatch({
+      capability: 'draft_reply',
+      messageId: 'm1',
+      instruction: 'Reply to alice',
+      draftBody: 'Thanks for your message!',
+    });
+
+    expect(outcome.success).toBe(true);
+    expect(outcome.action_taken).toBe('draft_reply');
+    expect(outcome.draftId).toBeDefined();
+
+    // Verify the draft exists in FakeGmail
+    const draft = gmail.getDraft(outcome.draftId!);
+    expect(draft).not.toBeNull();
+    expect(draft!.to).toBe('alice@example.com');
+    expect(draft!.subject).toBe('Re: hello');
+    expect(draft!.body).toBe('Thanks for your message!');
+  });
+
+  it('draft_reply verification confirms the draft exists', async () => {
+    const agent = createGmailSubAgent(gmail);
+    const outcome = await agent.dispatch({
+      capability: 'draft_reply',
+      messageId: 'm1',
+      instruction: 'Reply',
+      draftBody: 'Thanks!',
+    });
+
+    const verification = await agent.verify('m1', 'draft_reply', { draftId: outcome.draftId });
+    expect(verification.verified).toBe(true);
+    expect(verification.actual_state).toBe('draft_exists');
+  });
+
+  it('draft_reply fails for nonexistent message', async () => {
+    const agent = createGmailSubAgent(gmail);
+    const outcome = await agent.dispatch({
+      capability: 'draft_reply',
+      messageId: 'nonexistent',
+      instruction: 'Reply',
+      draftBody: 'Hello',
+    });
+
+    expect(outcome.success).toBe(false);
+    expect(outcome.error).toContain('not found');
+  });
+
+  it('draft_reply verification fails without draft ID', async () => {
+    const agent = createGmailSubAgent(gmail);
+    const verification = await agent.verify('m1', 'draft_reply');
+    expect(verification.verified).toBe(false);
+    expect(verification.actual_state).toBe('no_draft_id');
+  });
 });

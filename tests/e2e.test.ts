@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { FakeGmail } from '../src/gmail/fake.js';
 import { createExecutorServer, type ServerDeps } from '../src/executor/server.js';
-import { planGoal, type PlannerInput } from '../src/planner/index.js';
+import { planGoal, type PlannerInput, type Goal } from '../src/planner/index.js';
 import { sanitiseEnvForPlanner } from '../src/executor/plannerClient.js';
 import { redact } from '../src/redactor.js';
 import { loadRules, type Rules } from '../src/rules.js';
@@ -1776,5 +1776,291 @@ describe('slice 010 learned ranker with exploration', () => {
     writeFileSync(join(dir, 'principles.md'), `queue:\n  target_depth: 5\n  low_water_mark: 2\n  batch_threshold: 3\n  exploration_slots: 2\n`);
     const rules = loadRules(dir);
     expect(rules.queue.exploration_slots).toBe(2);
+  });
+});
+
+describe('slice 011 irreversibility halts and draft_reply', () => {
+  let dir: string;
+  let url: string;
+  let server: ReturnType<typeof createExecutorServer>;
+
+  afterEach(async () => {
+    if (server) await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('halts on irreversible action and surfaces a re-approval card', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-011-halt-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    // Planner returns a send_email action (declared irreversible)
+    const rulesWithIrreversible: Rules = {
+      ...EMPTY_RULES,
+      reversibility: [
+        { action: 'send_email', reversible: false },
+        { action: 'archive', reversible: true },
+      ],
+    };
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => ({
+        id: 'g-m1',
+        title: 'Send reply to alice',
+        reason: 'Reply needed',
+        messageId: 'm1',
+        transport: 'gmail',
+        action: 'send_email',
+      }),
+      getRules: () => rulesWithIrreversible,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    // Get the card
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+
+    // Approve it — should halt
+    const decRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(decRes.status).toBe(200);
+    const decBody = (await decRes.json()) as { ok: boolean; halted: boolean; reApprovalId: string };
+    expect(decBody.halted).toBe(true);
+    expect(decBody.reApprovalId).toContain('reapproval-');
+
+    // The queue should now contain the re-approval card
+    const queueRes = await fetch(`${url}/queue`);
+    const q = (await queueRes.json()) as { depth: number; cards: Array<{ id: string; title: string }> };
+    expect(q.depth).toBe(1);
+    expect(q.cards[0].title).toContain('irreversible');
+
+    // Journal should have a halt entry
+    const journal = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
+    const haltEntry = JSON.parse(journal[journal.length - 1]);
+    expect(haltEntry.kind).toBe('halt');
+    expect(haltEntry.action).toBe('send_email');
+  });
+
+  it('re-approval card shows original goal details', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-011-reapproval-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => ({
+        id: 'g-m1',
+        title: 'Send reply to alice',
+        reason: 'Urgent reply needed',
+        messageId: 'm1',
+        transport: 'gmail',
+        action: 'send_email',
+      }),
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'send_email', reversible: false }],
+      }),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+
+    // Check the re-approval card details
+    const reCardRes = await fetch(`${url}/card`);
+    const reGoal = (await reCardRes.json()) as { id: string; title: string; reason: string; action: string };
+    expect(reGoal.title).toContain('Send reply to alice');
+    expect(reGoal.reason).toContain('irreversible');
+    expect(reGoal.reason).toContain('Urgent reply needed');
+    expect(reGoal.action).toBe('send_email');
+  });
+
+  it('reversible actions dispatch without halting', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-011-reversible-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => ({
+        id: 'g-m1',
+        title: 'Archive newsletter',
+        reason: 'Low priority',
+        messageId: 'm1',
+        transport: 'gmail',
+        action: 'archive',
+      }),
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [
+          { action: 'archive', reversible: true },
+          { action: 'send_email', reversible: false },
+        ],
+      }),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const decRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const decBody = (await decRes.json()) as { ok: boolean; halted?: boolean };
+    expect(decBody.ok).toBe(true);
+    expect(decBody.halted).toBeUndefined();
+
+    // Message should be archived
+    expect(gmail.getById('m1')!.archived).toBe(true);
+  });
+
+  it('draft_reply happy path: creates and verifies a draft', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-011-draft-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => {
+        const goal: Goal & { draftBody?: string } = {
+          id: 'g-m1',
+          title: 'Draft reply to alice',
+          reason: 'Needs a response',
+          messageId: 'm1',
+          transport: 'gmail',
+          action: 'draft_reply',
+        };
+        (goal as unknown as Record<string, unknown>).draftBody = 'Thanks for your email!';
+        return goal;
+      },
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'draft_reply', reversible: true }],
+      }),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const decRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const decBody = (await decRes.json()) as {
+      ok: boolean;
+      outcomes: Array<{ success: boolean; draftId: string }>;
+      verification: { verified: boolean };
+    };
+    expect(decBody.ok).toBe(true);
+    expect(decBody.outcomes[0].success).toBe(true);
+    expect(decBody.outcomes[0].draftId).toBeDefined();
+    expect(decBody.verification.verified).toBe(true);
+
+    // Verify the draft exists in FakeGmail
+    const drafts = gmail.listDrafts();
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].to).toBe('alice@example.com');
+    expect(drafts[0].body).toBe('Thanks for your email!');
+
+    // Journal should have an action entry
+    const journal = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
+    const actionEntry = JSON.parse(journal[journal.length - 1]);
+    expect(actionEntry.kind).toBe('action');
+    expect(actionEntry.verification.verified).toBe(true);
+  });
+
+  it('rejecting a re-approval card journals the rejection', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-011-reject-reapproval-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => ({
+        id: 'g-m1',
+        title: 'Send email to alice',
+        reason: 'Reply needed',
+        messageId: 'm1',
+        transport: 'gmail',
+        action: 'send_email',
+      }),
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'send_email', reversible: false }],
+      }),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    // Get and approve to trigger halt
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const haltRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const haltBody = (await haltRes.json()) as { reApprovalId: string };
+
+    // Reject the re-approval card
+    const rejectRes = await fetch(`${url}/card/${haltBody.reApprovalId}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'reject' }),
+    });
+    expect(rejectRes.status).toBe(200);
+
+    // Queue should be empty
+    const queueRes = await fetch(`${url}/queue`);
+    const q = (await queueRes.json()) as { depth: number };
+    expect(q.depth).toBe(0);
+  });
+
+  it('principles.md reversibility declarations are parsed correctly', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-011-rules-'));
+    writeFileSync(
+      join(dir, 'principles.md'),
+      `reversibility:\n  - action: archive\n    reversible: true\n  - action: send_email\n    reversible: false\n  - action: draft_reply\n    reversible: true\n`,
+    );
+    const rules = loadRules(dir);
+    expect(rules.reversibility).toEqual([
+      { action: 'archive', reversible: true },
+      { action: 'send_email', reversible: false },
+      { action: 'draft_reply', reversible: true },
+    ]);
   });
 });

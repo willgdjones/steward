@@ -9,6 +9,8 @@ export interface SubAgentInstruction {
   messageId: string;
   /** Free-form natural-language instruction describing what to do. */
   instruction: string;
+  /** For draft_reply: the body of the draft to create. */
+  draftBody?: string;
 }
 
 /**
@@ -19,6 +21,8 @@ export interface SubAgentOutcome {
   action_taken: string;
   messageId: string;
   error?: string;
+  /** For draft_reply: the ID of the created draft. */
+  draftId?: string;
 }
 
 /**
@@ -32,7 +36,7 @@ export interface VerificationResult {
 
 export interface GmailSubAgent {
   dispatch(instruction: SubAgentInstruction): Promise<SubAgentOutcome>;
-  verify(messageId: string, expectedAction: string): Promise<VerificationResult>;
+  verify(messageId: string, expectedAction: string, meta?: { draftId?: string }): Promise<VerificationResult>;
 }
 
 /**
@@ -42,47 +46,79 @@ export interface GmailSubAgent {
 export function createGmailSubAgent(gmail: FakeGmail): GmailSubAgent {
   return {
     async dispatch(instruction: SubAgentInstruction): Promise<SubAgentOutcome> {
-      if (instruction.capability !== 'archive') {
+      if (instruction.capability === 'archive') {
+        const found = gmail.archive(instruction.messageId);
+        if (!found) {
+          return {
+            success: false,
+            action_taken: 'archive',
+            messageId: instruction.messageId,
+            error: `message not found: ${instruction.messageId}`,
+          };
+        }
         return {
-          success: false,
-          action_taken: instruction.capability,
+          success: true,
+          action_taken: 'archive',
           messageId: instruction.messageId,
-          error: `unknown capability: ${instruction.capability}`,
         };
       }
 
-      const found = gmail.archive(instruction.messageId);
-      if (!found) {
+      if (instruction.capability === 'draft_reply') {
+        const body = instruction.draftBody ?? instruction.instruction;
+        const draft = gmail.createDraft(instruction.messageId, body);
+        if (!draft) {
+          return {
+            success: false,
+            action_taken: 'draft_reply',
+            messageId: instruction.messageId,
+            error: `message not found: ${instruction.messageId}`,
+          };
+        }
         return {
-          success: false,
-          action_taken: 'archive',
+          success: true,
+          action_taken: 'draft_reply',
           messageId: instruction.messageId,
-          error: `message not found: ${instruction.messageId}`,
+          draftId: draft.id,
         };
       }
 
       return {
-        success: true,
-        action_taken: 'archive',
+        success: false,
+        action_taken: instruction.capability,
         messageId: instruction.messageId,
+        error: `unknown capability: ${instruction.capability}`,
       };
     },
 
-    async verify(messageId: string, expectedAction: string): Promise<VerificationResult> {
-      if (expectedAction !== 'archive') {
-        return { verified: false, actual_state: 'unknown', messageId };
+    async verify(messageId: string, expectedAction: string, meta?: { draftId?: string }): Promise<VerificationResult> {
+      if (expectedAction === 'archive') {
+        const msg = gmail.getById(messageId);
+        if (!msg) {
+          return { verified: false, actual_state: 'not_found', messageId };
+        }
+        return {
+          verified: msg.archived === true,
+          actual_state: msg.archived ? 'archived' : 'not_archived',
+          messageId,
+        };
       }
 
-      const msg = gmail.getById(messageId);
-      if (!msg) {
-        return { verified: false, actual_state: 'not_found', messageId };
+      if (expectedAction === 'draft_reply') {
+        if (!meta?.draftId) {
+          return { verified: false, actual_state: 'no_draft_id', messageId };
+        }
+        const draft = gmail.getDraft(meta.draftId);
+        if (!draft) {
+          return { verified: false, actual_state: 'draft_not_found', messageId };
+        }
+        return {
+          verified: draft.inReplyTo === messageId,
+          actual_state: 'draft_exists',
+          messageId,
+        };
       }
 
-      return {
-        verified: msg.archived === true,
-        actual_state: msg.archived ? 'archived' : 'not_archived',
-        messageId,
-      };
+      return { verified: false, actual_state: 'unknown', messageId };
     },
   };
 }

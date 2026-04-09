@@ -43,6 +43,10 @@ interface CardState {
   breakdown?: import('../ranker.js').ScoreBreakdown;
   /** Whether this card fills an exploration slot. */
   exploration?: boolean;
+  /** When true, this card is a re-approval for an irreversible action that was halted. */
+  reApproval?: boolean;
+  /** The original goal that triggered the halt (carried on re-approval cards). */
+  originalGoal?: Goal;
 }
 
 const WEB_CLIENT_HTML = `<!doctype html>
@@ -433,57 +437,129 @@ export function createExecutorServer(deps: ServerDeps): Server {
             return;
           }
         }
-        // If approving an actionable goal, dispatch to the sub-agent
-        if (decision === 'approve' && card.goal.action === 'archive' && card.goal.transport === 'gmail') {
-          const isBatch = card.batchMessages && card.batchMessages.length > 1;
-          const messageIds = isBatch ? card.batchMessages!.map((m) => m.id) : [card.message.id];
+        // Check if the action is irreversible and needs a halt (unless this IS a re-approval card)
+        if (decision === 'approve' && card.goal.transport === 'gmail' && card.goal.action && !card.reApproval) {
+          const rules = deps.getRules();
+          const decl = rules.reversibility.find((r) => r.action === card.goal.action);
+          if (decl && !decl.reversible) {
+            // Halt: surface a re-approval card instead of dispatching
+            const reApprovalGoal: Goal = {
+              id: `reapproval-${card.goal.id}`,
+              title: `⚠ Confirm irreversible: ${card.goal.title}`,
+              reason: `This action (${card.goal.action}) is irreversible. Original goal: ${card.goal.reason}`,
+              messageId: card.goal.messageId,
+              transport: card.goal.transport,
+              action: card.goal.action,
+            };
+            const reApprovalCard: CardState = {
+              goal: reApprovalGoal,
+              message: card.message,
+              features: card.features,
+              reApproval: true,
+              originalGoal: card.goal,
+            };
+            // Remove original card and insert re-approval at front
+            queue.splice(idx, 1);
+            queue.unshift(reApprovalCard);
+            appendJournal(deps.journalPath, {
+              kind: 'halt',
+              goalId: card.goal.id,
+              messageId: card.message.id,
+              action: card.goal.action,
+              reason: 'irreversible action requires re-approval',
+            });
+            send(res, 200, JSON.stringify({ ok: true, halted: true, reApprovalId: reApprovalGoal.id }));
+            return;
+          }
+        }
 
-          // Dispatch archive for all messages in the batch (or single message)
-          const outcomes = [];
-          for (const msgId of messageIds) {
+        // If approving an actionable gmail goal, dispatch to the sub-agent
+        if (decision === 'approve' && card.goal.transport === 'gmail' && card.goal.action) {
+          const action = card.goal.action;
+          // Handle archive (single or batch)
+          if (action === 'archive') {
+            const isBatch = card.batchMessages && card.batchMessages.length > 1;
+            const messageIds = isBatch ? card.batchMessages!.map((m) => m.id) : [card.message.id];
+
+            const outcomes = [];
+            for (const msgId of messageIds) {
+              const instruction = {
+                capability: action,
+                messageId: msgId,
+                instruction: `Archive message (batch: ${card.goal.title})`,
+              };
+              const outcome = await gmailSubAgent.dispatch(instruction);
+              outcomes.push(outcome);
+            }
+
+            const sampleIds = isBatch
+              ? [...new Set([messageIds[0], messageIds[Math.floor(messageIds.length / 2)], messageIds[messageIds.length - 1]])]
+              : messageIds;
+            const verifications = [];
+            for (const msgId of sampleIds) {
+              const v = await gmailSubAgent.verify(msgId, action);
+              verifications.push(v);
+            }
+            const allVerified = verifications.every((v) => v.verified);
+
+            appendJournal(deps.journalPath, {
+              kind: 'action',
+              goalId: card.goal.id,
+              messageId: card.message.id,
+              messageIds,
+              batchSize: messageIds.length,
+              title: card.goal.title,
+              outcomes,
+              verification: { verified: allVerified, sample: verifications },
+            });
+
+            queue.splice(idx, 1);
+            for (const msgId of messageIds) {
+              queuedMessageIds.delete(msgId);
+            }
+            send(res, 200, JSON.stringify({
+              ok: true,
+              outcomes,
+              verification: { verified: allVerified, sample: verifications },
+              batchSize: messageIds.length,
+            }));
+            return;
+          }
+
+          // Handle draft_reply
+          if (action === 'draft_reply') {
             const instruction = {
-              capability: card.goal.action,
-              messageId: msgId,
-              instruction: `Archive message (batch: ${card.goal.title})`,
+              capability: 'draft_reply',
+              messageId: card.message.id,
+              instruction: card.goal.title,
+              draftBody: (card.goal as unknown as Record<string, unknown>).draftBody as string | undefined,
             };
             const outcome = await gmailSubAgent.dispatch(instruction);
-            outcomes.push(outcome);
-          }
 
-          // Verify a sample: first, last, and one from the middle
-          const sampleIds = isBatch
-            ? [...new Set([messageIds[0], messageIds[Math.floor(messageIds.length / 2)], messageIds[messageIds.length - 1]])]
-            : messageIds;
-          const verifications = [];
-          for (const msgId of sampleIds) {
-            const v = await gmailSubAgent.verify(msgId, card.goal.action);
-            verifications.push(v);
-          }
-          const allVerified = verifications.every((v) => v.verified);
+            const verification = await gmailSubAgent.verify(
+              card.message.id,
+              'draft_reply',
+              { draftId: outcome.draftId },
+            );
 
-          appendJournal(deps.journalPath, {
-            kind: 'action',
-            goalId: card.goal.id,
-            messageId: card.message.id,
-            messageIds,
-            batchSize: messageIds.length,
-            title: card.goal.title,
-            outcomes,
-            verification: { verified: allVerified, sample: verifications },
-          });
+            appendJournal(deps.journalPath, {
+              kind: 'action',
+              goalId: card.goal.id,
+              messageId: card.message.id,
+              title: card.goal.title,
+              outcomes: [outcome],
+              verification: { verified: verification.verified, sample: [verification] },
+            });
 
-          // Remove card and clean up all queued message IDs
-          queue.splice(idx, 1);
-          for (const msgId of messageIds) {
-            queuedMessageIds.delete(msgId);
+            queue.splice(idx, 1);
+            queuedMessageIds.delete(card.message.id);
+            send(res, 200, JSON.stringify({
+              ok: true,
+              outcomes: [outcome],
+              verification: { verified: verification.verified, sample: [verification] },
+            }));
+            return;
           }
-          send(res, 200, JSON.stringify({
-            ok: true,
-            outcomes,
-            verification: { verified: allVerified, sample: verifications },
-            batchSize: messageIds.length,
-          }));
-          return;
         }
 
         // Handle promotion meta-card decisions

@@ -2,6 +2,13 @@
 
 ## 2026-04-09
 
+### Slice 011 — irreversibility halts and draft reply
+- Added `draft_reply` capability to the Gmail sub-agent: creates a Gmail draft in reply to a message, returns the draft ID, and verifies the draft exists.
+- `src/gmail/fake.ts`: added `GmailDraft` type, `createDraft()`, `getDraft()`, `listDrafts()` methods to FakeGmail.
+- `src/gmail/subagent.ts`: extended `dispatch()` to handle `draft_reply` (creates draft via FakeGmail). Extended `verify()` with optional `meta` parameter for draft verification. Added `draftBody` to `SubAgentInstruction` and `draftId` to `SubAgentOutcome`.
+- `src/executor/server.ts`: implemented halt-on-irreversible machinery. When an approved goal's action is declared irreversible in `principles.md`, the executor halts before dispatching, journals a `kind: 'halt'` entry, and surfaces a re-approval card showing the original goal, the irreversible action, and the reason. Re-approval cards dispatch normally when approved. Added `draft_reply` dispatch path with verification.
+- 126 tests across 11 files; 10 new tests covering draft_reply dispatch/verify, halt on irreversible actions, re-approval card content, reversible action passthrough, re-approval rejection, and reversibility config parsing.
+
 ### Slice 010 — learned ranker with exploration
 - Promoted the floor-only ranker to a full feature scorer with weights learned from swipe history, clamping, exploration slots, and per-card score breakdowns.
 - `src/ranker.ts`: added `FeatureVector` (deadline_proximity, has_amount, waiting_on_user, urgency), `FeatureWeights` with clamped bounds, `extractFeatureVector()`, `scoreCandidate()`, `learnWeights()` from journal decision entries. `rankCandidates()` now uses learned weights, reserves exploration slots for high-uncertainty candidates, and attaches `ScoreBreakdown` to each ranked candidate.

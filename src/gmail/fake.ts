@@ -10,6 +10,15 @@ export interface GmailMessage {
   archived?: boolean;
 }
 
+export interface GmailDraft {
+  id: string;
+  /** The message this draft is a reply to. */
+  inReplyTo: string;
+  to: string;
+  subject: string;
+  body: string;
+}
+
 /**
  * Fake Gmail provider for the slice-002 tracer bullet. The real Gmail
  * provider (issue 004) will replace this; the surface stays the same.
@@ -18,6 +27,8 @@ export interface GmailMessage {
  * executor can read from it without any network or OAuth.
  */
 export class FakeGmail {
+  private drafts: GmailDraft[] = [];
+
   constructor(private readonly path: string) {}
 
   load(): GmailMessage[] {
@@ -57,5 +68,30 @@ export class FakeGmail {
     msg.archived = true;
     this.save(messages);
     return true;
+  }
+
+  /** Create a draft reply to a message. Returns the draft, or null if the message doesn't exist. */
+  createDraft(inReplyTo: string, body: string): GmailDraft | null {
+    const msg = this.getById(inReplyTo);
+    if (!msg) return null;
+    const draft: GmailDraft = {
+      id: `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      inReplyTo,
+      to: msg.from,
+      subject: msg.subject.startsWith('Re: ') ? msg.subject : `Re: ${msg.subject}`,
+      body,
+    };
+    this.drafts.push(draft);
+    return draft;
+  }
+
+  /** Look up a draft by ID. */
+  getDraft(id: string): GmailDraft | null {
+    return this.drafts.find((d) => d.id === id) ?? null;
+  }
+
+  /** List all drafts. */
+  listDrafts(): GmailDraft[] {
+    return [...this.drafts];
   }
 }
