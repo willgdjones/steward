@@ -48,6 +48,11 @@ export interface PromotionConfig {
   interval_minutes: number;
 }
 
+export interface CredentialScopeDecl {
+  action: string;
+  refs: string[];
+}
+
 export interface Rules {
   blacklist: BlacklistEntry[];
   redaction: RedactionRule[];
@@ -55,6 +60,7 @@ export interface Rules {
   urgent_senders: string[];
   floor: FloorReservation[];
   reversibility: ReversibilityDecl[];
+  credential_scopes: CredentialScopeDecl[];
   verifier: VerifierConfig;
   promotion: PromotionConfig;
 }
@@ -72,6 +78,7 @@ const EMPTY_RULES: Rules = {
   urgent_senders: [],
   floor: [],
   reversibility: [],
+  credential_scopes: [],
   verifier: { ...DEFAULT_VERIFIER },
   promotion: { ...DEFAULT_PROMOTION },
 };
@@ -143,7 +150,14 @@ export function loadRules(dir: string): Rules {
     interval_minutes: typeof promotionRaw?.interval_minutes === 'number' ? promotionRaw.interval_minutes : DEFAULT_PROMOTION.interval_minutes,
   };
 
-  return { blacklist, redaction, queue, urgent_senders, floor, reversibility, verifier, promotion };
+  const credential_scopes: CredentialScopeDecl[] = Array.isArray(principles.credential_scopes)
+    ? (principles.credential_scopes as Array<Record<string, unknown>>).map((e) => ({
+        action: String(e.action),
+        refs: Array.isArray(e.refs) ? (e.refs as string[]).map(String) : [],
+      }))
+    : [];
+
+  return { blacklist, redaction, queue, urgent_senders, floor, reversibility, credential_scopes, verifier, promotion };
 }
 
 export function watchRules(

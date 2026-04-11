@@ -160,4 +160,70 @@ describe('Gmail sub-agent', () => {
     expect(verification.verified).toBe(false);
     expect(verification.actual_state).toBe('no_draft_id');
   });
+
+  it('sends an existing draft and returns success', async () => {
+    const agent = createGmailSubAgent(gmail);
+    // First create a draft
+    const draftOutcome = await agent.dispatch({
+      capability: 'draft_reply',
+      messageId: 'm1',
+      instruction: 'Reply',
+      draftBody: 'Hello!',
+    });
+    expect(draftOutcome.draftId).toBeDefined();
+
+    // Now send it
+    const sendOutcome = await agent.dispatch({
+      capability: 'send_draft',
+      messageId: 'm1',
+      instruction: 'Send draft',
+      draftId: draftOutcome.draftId,
+    });
+    expect(sendOutcome.success).toBe(true);
+    expect(sendOutcome.action_taken).toBe('send_draft');
+    expect(sendOutcome.draftId).toBe(draftOutcome.draftId);
+  });
+
+  it('send_draft verification confirms the draft was sent', async () => {
+    const agent = createGmailSubAgent(gmail);
+    const draftOutcome = await agent.dispatch({
+      capability: 'draft_reply',
+      messageId: 'm1',
+      instruction: 'Reply',
+      draftBody: 'Hello!',
+    });
+    await agent.dispatch({
+      capability: 'send_draft',
+      messageId: 'm1',
+      instruction: 'Send',
+      draftId: draftOutcome.draftId,
+    });
+
+    const verification = await agent.verify('m1', 'send_draft', { draftId: draftOutcome.draftId });
+    expect(verification.verified).toBe(true);
+    expect(verification.actual_state).toBe('sent');
+  });
+
+  it('send_draft fails without a draftId', async () => {
+    const agent = createGmailSubAgent(gmail);
+    const outcome = await agent.dispatch({
+      capability: 'send_draft',
+      messageId: 'm1',
+      instruction: 'Send',
+    });
+    expect(outcome.success).toBe(false);
+    expect(outcome.error).toContain('no draftId');
+  });
+
+  it('send_draft fails for nonexistent draft', async () => {
+    const agent = createGmailSubAgent(gmail);
+    const outcome = await agent.dispatch({
+      capability: 'send_draft',
+      messageId: 'm1',
+      instruction: 'Send',
+      draftId: 'nonexistent',
+    });
+    expect(outcome.success).toBe(false);
+    expect(outcome.error).toContain('not found');
+  });
 });

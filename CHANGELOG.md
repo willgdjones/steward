@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-04-11
+
+### Slice 012 — send_draft and 1Password credential gating
+- Added `send_draft` capability to the Gmail sub-agent: sends an existing draft, verifies it was sent, declared irreversible in principles.md.
+- `src/gmail/fake.ts`: added `sendDraft()` method and `sent` field on `GmailDraft`.
+- `src/gmail/subagent.ts`: extended `dispatch()` for `send_draft` (sends via FakeGmail, returns draftId). Extended `verify()` for `send_draft` (confirms draft.sent).
+- `src/credentials.ts` (NEW): `resolveOpReference()` calls `op read <ref>` at dispatch time, never logs resolved value. `isVaultUnlocked()` checks vault state via `op whoami`. `checkCredentialScopes()` validates required refs before dispatch. Injectable `CredentialResolver` interface for testing.
+- `src/rules.ts`: added `CredentialScopeDecl` type and `credential_scopes` field to Rules. Parsed from principles.md YAML.
+- `src/executor/server.ts`: credential check gate before dispatch — refuses with 403 + `credential_refused` when vault is locked or refs fail. `ServerDeps.credentialResolver` injectable for testing. `send_draft` dispatch path with verification. Re-approval cards now carry over extra goal properties (draftId, draftBody).
+- Fixed pre-existing test fragility: floor reservation tests used hardcoded deadlines that expired; replaced with relative future dates.
+- 141 tests across 12 files; 15 new tests covering send_draft dispatch/verify, credential scope checking, vault-locked refusal, unlocked passthrough, and config parsing.
+
 ## 2026-04-09
 
 ### Slice 011 — irreversibility halts and draft reply

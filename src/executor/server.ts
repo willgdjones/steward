@@ -15,6 +15,7 @@ import { clusterCandidates, type TriagedCandidate } from '../batcher.js';
 import { detectAnomalies } from '../verifier.js';
 import { readJournal } from '../journal.js';
 import { detectPromotions } from '../promoter.js';
+import { checkCredentialScopes, type CredentialResolver } from '../credentials.js';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -31,6 +32,8 @@ export interface ServerDeps {
   searchQuery?: string;
   /** Directory containing rules files (principles.md, gmail.md). Needed for rule promotion writes. */
   rulesDir?: string;
+  /** Credential resolver for op:// references. If omitted, credential checks are skipped. */
+  credentialResolver?: CredentialResolver;
 }
 
 interface CardState {
@@ -451,6 +454,12 @@ export function createExecutorServer(deps: ServerDeps): Server {
               transport: card.goal.transport,
               action: card.goal.action,
             };
+            // Carry over extra properties (e.g. draftId, draftBody) from the original goal
+            const extras = card.goal as unknown as Record<string, unknown>;
+            const reExtras = reApprovalGoal as unknown as Record<string, unknown>;
+            for (const key of ['draftId', 'draftBody', 'messageIds', 'batchSize']) {
+              if (extras[key] !== undefined) reExtras[key] = extras[key];
+            }
             const reApprovalCard: CardState = {
               goal: reApprovalGoal,
               message: card.message,
@@ -469,6 +478,25 @@ export function createExecutorServer(deps: ServerDeps): Server {
               reason: 'irreversible action requires re-approval',
             });
             send(res, 200, JSON.stringify({ ok: true, halted: true, reApprovalId: reApprovalGoal.id }));
+            return;
+          }
+        }
+
+        // Check credential scopes before dispatching
+        if (decision === 'approve' && card.goal.transport === 'gmail' && card.goal.action && deps.credentialResolver) {
+          const rules = deps.getRules();
+          const credCheck = checkCredentialScopes(card.goal.action, rules.credential_scopes, deps.credentialResolver);
+          if (!credCheck.allowed) {
+            appendJournal(deps.journalPath, {
+              kind: 'credential_refused',
+              goalId: card.goal.id,
+              messageId: card.message.id,
+              action: card.goal.action,
+              reason: credCheck.reason,
+            });
+            queue.splice(idx, 1);
+            queuedMessageIds.delete(card.message.id);
+            send(res, 403, JSON.stringify({ error: 'credential_refused', reason: credCheck.reason }));
             return;
           }
         }
@@ -539,6 +567,42 @@ export function createExecutorServer(deps: ServerDeps): Server {
             const verification = await gmailSubAgent.verify(
               card.message.id,
               'draft_reply',
+              { draftId: outcome.draftId },
+            );
+
+            appendJournal(deps.journalPath, {
+              kind: 'action',
+              goalId: card.goal.id,
+              messageId: card.message.id,
+              title: card.goal.title,
+              outcomes: [outcome],
+              verification: { verified: verification.verified, sample: [verification] },
+            });
+
+            queue.splice(idx, 1);
+            queuedMessageIds.delete(card.message.id);
+            send(res, 200, JSON.stringify({
+              ok: true,
+              outcomes: [outcome],
+              verification: { verified: verification.verified, sample: [verification] },
+            }));
+            return;
+          }
+
+          // Handle send_draft
+          if (action === 'send_draft') {
+            const draftId = (card.goal as unknown as Record<string, unknown>).draftId as string | undefined;
+            const instruction = {
+              capability: 'send_draft',
+              messageId: card.message.id,
+              instruction: card.goal.title,
+              draftId,
+            };
+            const outcome = await gmailSubAgent.dispatch(instruction);
+
+            const verification = await gmailSubAgent.verify(
+              card.message.id,
+              'send_draft',
               { draftId: outcome.draftId },
             );
 

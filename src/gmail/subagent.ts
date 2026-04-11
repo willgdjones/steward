@@ -11,6 +11,8 @@ export interface SubAgentInstruction {
   instruction: string;
   /** For draft_reply: the body of the draft to create. */
   draftBody?: string;
+  /** For send_draft: the ID of the draft to send. */
+  draftId?: string;
 }
 
 /**
@@ -82,6 +84,32 @@ export function createGmailSubAgent(gmail: FakeGmail): GmailSubAgent {
         };
       }
 
+      if (instruction.capability === 'send_draft') {
+        if (!instruction.draftId) {
+          return {
+            success: false,
+            action_taken: 'send_draft',
+            messageId: instruction.messageId,
+            error: 'no draftId provided',
+          };
+        }
+        const sent = gmail.sendDraft(instruction.draftId);
+        if (!sent) {
+          return {
+            success: false,
+            action_taken: 'send_draft',
+            messageId: instruction.messageId,
+            error: `draft not found or already sent: ${instruction.draftId}`,
+          };
+        }
+        return {
+          success: true,
+          action_taken: 'send_draft',
+          messageId: instruction.messageId,
+          draftId: sent.id,
+        };
+      }
+
       return {
         success: false,
         action_taken: instruction.capability,
@@ -114,6 +142,21 @@ export function createGmailSubAgent(gmail: FakeGmail): GmailSubAgent {
         return {
           verified: draft.inReplyTo === messageId,
           actual_state: 'draft_exists',
+          messageId,
+        };
+      }
+
+      if (expectedAction === 'send_draft') {
+        if (!meta?.draftId) {
+          return { verified: false, actual_state: 'no_draft_id', messageId };
+        }
+        const draft = gmail.getDraft(meta.draftId);
+        if (!draft) {
+          return { verified: false, actual_state: 'draft_not_found', messageId };
+        }
+        return {
+          verified: draft.sent === true,
+          actual_state: draft.sent ? 'sent' : 'not_sent',
           messageId,
         };
       }

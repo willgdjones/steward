@@ -18,6 +18,7 @@ const EMPTY_RULES: Rules = {
   urgent_senders: [],
   floor: [],
   reversibility: [],
+  credential_scopes: [],
   verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
 };
@@ -162,6 +163,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -219,6 +221,7 @@ describe('slice 003 principles gate + redactor rules', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -352,6 +355,7 @@ describe('slice 004 two-stage pipeline', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -459,6 +463,7 @@ describe('slice 005 queue with deterministic floor', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
       ...rest,
@@ -612,11 +617,13 @@ describe('slice 005 queue with deterministic floor', () => {
 
   it('floor reservations are honoured before tiebreaker', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'steward-005-floor-'));
-    const now = new Date('2026-04-09T12:00:00Z');
     const rules = makeQueueRules({
       queue: { target_depth: 3, low_water_mark: 1, batch_threshold: 999, exploration_slots: 0 },
       floor: [{ match: { deadline_within_hours: 72 }, slots: 1 }],
     });
+
+    // Use a deadline 24h in the future so the floor reservation always matches
+    const futureDeadline = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
     const messages = [
       { id: 'high', from: 'a@test.com', subject: 'high urgency', body: 'b', unread: true },
@@ -631,7 +638,7 @@ describe('slice 005 queue with deterministic floor', () => {
         snippet: 'high urgency task',
       },
       deadline: {
-        features: { deadline: '2026-04-10T12:00:00Z', amount: null, waiting_on_user: false, category: 'other', urgency: 'low' },
+        features: { deadline: futureDeadline, amount: null, waiting_on_user: false, category: 'other', urgency: 'low' },
         snippet: 'task with deadline',
       },
       low: {
@@ -693,6 +700,7 @@ describe('slice 006 archive via sub-agent', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -757,6 +765,7 @@ describe('slice 006 archive via sub-agent', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -808,6 +817,7 @@ describe('slice 006 archive via sub-agent', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -871,6 +881,7 @@ describe('slice 007 batched action card', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
   promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -1297,6 +1308,7 @@ describe('slice 009 rule promotion meta-cards', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
       promotion: { threshold: 3, cooldown_minutes: 1440, interval_minutes: 120, ...overrides },
     };
@@ -1539,6 +1551,7 @@ describe('slice 010 learned ranker with exploration', () => {
       urgent_senders: [],
       floor: [],
       reversibility: [{ action: 'archive', reversible: true }],
+      credential_scopes: [],
       verifier: { interval_minutes: 60 },
       promotion: { threshold: 5, cooldown_minutes: 1440, interval_minutes: 120 },
     };
@@ -1734,8 +1747,9 @@ describe('slice 010 learned ranker with exploration', () => {
     // Custom triage
     const triage = async (msg: import('../src/gmail/fake.js').GmailMessage) => {
       if (msg.id === 'm-deadline') {
+        const futureDeadline = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
         return {
-          features: { urgency: 'low' as const, deadline: '2026-04-10T00:00:00Z', amount: null, waiting_on_user: false, category: 'work' },
+          features: { urgency: 'low' as const, deadline: futureDeadline, amount: null, waiting_on_user: false, category: 'work' },
           snippet: 'deadline item',
         };
       }
@@ -2061,6 +2075,265 @@ describe('slice 011 irreversibility halts and draft_reply', () => {
       { action: 'archive', reversible: true },
       { action: 'send_email', reversible: false },
       { action: 'draft_reply', reversible: true },
+    ]);
+  });
+});
+
+describe('slice 012 send_draft and credential gating', () => {
+  let dir: string;
+  let url: string;
+  let server: ReturnType<typeof createExecutorServer>;
+
+  afterEach(async () => {
+    if (server) await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('send_draft halts as irreversible, re-approval dispatches and verifies', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-012-send-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+    // Pre-create a draft so send_draft has something to send
+    const draft = gmail.createDraft('m1', 'My reply');
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => {
+        const goal = {
+          id: 'g-m1',
+          title: 'Send reply to alice',
+          reason: 'Reply to hello',
+          messageId: 'm1',
+          transport: 'gmail',
+          action: 'send_draft',
+        };
+        (goal as unknown as Record<string, unknown>).draftId = draft!.id;
+        return goal;
+      },
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'send_draft', reversible: false }],
+        credential_scopes: [],
+      }),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    // Get the card and approve — should halt
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const haltRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const haltBody = (await haltRes.json()) as { halted: boolean; reApprovalId: string };
+    expect(haltBody.halted).toBe(true);
+
+    // Re-approval card shows recipient/subject context
+    const reCardRes = await fetch(`${url}/card`);
+    const reGoal = (await reCardRes.json()) as { id: string; title: string; reason: string };
+    expect(reGoal.title).toContain('Send reply to alice');
+    expect(reGoal.reason).toContain('irreversible');
+
+    // Approve the re-approval — should dispatch and verify
+    const sendRes = await fetch(`${url}/card/${reGoal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const sendBody = (await sendRes.json()) as {
+      ok: boolean;
+      outcomes: Array<{ success: boolean; draftId: string }>;
+      verification: { verified: boolean };
+    };
+    expect(sendBody.ok).toBe(true);
+    expect(sendBody.outcomes[0].success).toBe(true);
+    expect(sendBody.verification.verified).toBe(true);
+
+    // Draft should be marked as sent
+    expect(gmail.getDraft(draft!.id)!.sent).toBe(true);
+  });
+
+  it('credential check refuses send_draft when vault is locked', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-012-locked-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+    const draft = gmail.createDraft('m1', 'My reply');
+
+    const lockedResolver = {
+      resolve: () => { throw new Error('vault locked'); },
+      isUnlocked: () => false,
+    };
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => {
+        const goal = {
+          id: 'g-m1',
+          title: 'Send reply',
+          reason: 'Reply needed',
+          messageId: 'm1',
+          transport: 'gmail',
+          action: 'send_draft',
+        };
+        (goal as unknown as Record<string, unknown>).draftId = draft!.id;
+        return goal;
+      },
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'send_draft', reversible: false }],
+        credential_scopes: [{ action: 'send_draft', refs: ['op://vault/gmail/token'] }],
+      }),
+      credentialResolver: lockedResolver,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    // Get card, approve, then approve re-approval (halt first)
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const haltRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const haltBody = (await haltRes.json()) as { reApprovalId: string };
+
+    // Approve the re-approval — credential check should refuse
+    const sendRes = await fetch(`${url}/card/${haltBody.reApprovalId}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(sendRes.status).toBe(403);
+    const sendBody = (await sendRes.json()) as { error: string; reason: string };
+    expect(sendBody.error).toBe('credential_refused');
+    expect(sendBody.reason).toContain('locked');
+
+    // Journal should have a credential_refused entry
+    const journal = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
+    const refused = JSON.parse(journal[journal.length - 1]);
+    expect(refused.kind).toBe('credential_refused');
+  });
+
+  it('credential check allows send_draft when vault is unlocked', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-012-unlocked-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+    const draft = gmail.createDraft('m1', 'My reply');
+
+    const unlockedResolver = {
+      resolve: () => 'fake-token-value',
+      isUnlocked: () => true,
+    };
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => {
+        const goal = {
+          id: 'g-m1',
+          title: 'Send reply',
+          reason: 'Reply',
+          messageId: 'm1',
+          transport: 'gmail',
+          action: 'send_draft',
+        };
+        (goal as unknown as Record<string, unknown>).draftId = draft!.id;
+        return goal;
+      },
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'send_draft', reversible: false }],
+        credential_scopes: [{ action: 'send_draft', refs: ['op://vault/gmail/token'] }],
+      }),
+      credentialResolver: unlockedResolver,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    // Get card → approve → halt → approve re-approval → should succeed
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const haltRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const haltBody = (await haltRes.json()) as { reApprovalId: string };
+
+    const sendRes = await fetch(`${url}/card/${haltBody.reApprovalId}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(sendRes.status).toBe(200);
+    const sendBody = (await sendRes.json()) as { ok: boolean; verification: { verified: boolean } };
+    expect(sendBody.ok).toBe(true);
+    expect(sendBody.verification.verified).toBe(true);
+    expect(gmail.getDraft(draft!.id)!.sent).toBe(true);
+  });
+
+  it('actions without credential scopes pass through without resolver', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-012-noscope-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => ({
+        id: 'g-m1',
+        title: 'Archive message',
+        reason: 'Low priority',
+        messageId: 'm1',
+        transport: 'gmail',
+        action: 'archive',
+      }),
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'archive', reversible: true }],
+        credential_scopes: [{ action: 'send_draft', refs: ['op://vault/gmail/token'] }],
+      }),
+      // No credentialResolver — archive doesn't need one
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const decRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    expect(decRes.status).toBe(200);
+    expect(gmail.getById('m1')!.archived).toBe(true);
+  });
+
+  it('credential_scopes parsed from principles.md', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steward-012-rules-'));
+    writeFileSync(
+      join(dir, 'principles.md'),
+      `credential_scopes:\n  - action: send_draft\n    refs:\n      - op://vault/gmail/refresh_token\n      - op://vault/gmail/client_secret\n`,
+    );
+    const rules = loadRules(dir);
+    expect(rules.credential_scopes).toEqual([
+      { action: 'send_draft', refs: ['op://vault/gmail/refresh_token', 'op://vault/gmail/client_secret'] },
     ]);
   });
 });

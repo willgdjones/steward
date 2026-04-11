@@ -17,6 +17,8 @@ export interface GmailDraft {
   to: string;
   subject: string;
   body: string;
+  /** Whether this draft has been sent. */
+  sent?: boolean;
 }
 
 /**
@@ -93,5 +95,14 @@ export class FakeGmail {
   /** List all drafts. */
   listDrafts(): GmailDraft[] {
     return [...this.drafts];
+  }
+
+  /** Send an existing draft. Returns the draft if found, null otherwise. Marks it as sent. */
+  sendDraft(draftId: string): GmailDraft | null {
+    const draft = this.drafts.find((d) => d.id === draftId);
+    if (!draft) return null;
+    if (draft.sent) return null; // already sent
+    draft.sent = true;
+    return draft;
   }
 }
