@@ -10,6 +10,7 @@ import { sanitiseEnvForPlanner } from '../src/executor/plannerClient.js';
 import { redact } from '../src/redactor.js';
 import { loadRules, type Rules } from '../src/rules.js';
 import type { JournalEntry } from '../src/journal.js';
+import WebSocket from 'ws';
 
 const EMPTY_RULES: Rules = {
   blacklist: [],
@@ -2335,5 +2336,190 @@ describe('slice 012 send_draft and credential gating', () => {
     expect(rules.credential_scopes).toEqual([
       { action: 'send_draft', refs: ['op://vault/gmail/refresh_token', 'op://vault/gmail/client_secret'] },
     ]);
+  });
+});
+
+describe('slice 013 terminal client and websocket', () => {
+  let dir: string;
+  let url: string;
+  let wsUrl: string;
+  let server: ReturnType<typeof createExecutorServer>;
+
+  afterEach(async () => {
+    if (server) await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('WebSocket receives initial queue state on connect', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-013-ws-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+    wsUrl = `ws://127.0.0.1:${port}`;
+
+    // Trigger refill so queue has a card
+    await fetch(`${url}/refill`, { method: 'POST' });
+
+    // Connect WS
+    const ws = new WebSocket(wsUrl);
+    const msg = await new Promise<string>((resolve) => {
+      ws.on('message', (data) => resolve(data.toString()));
+    });
+    ws.close();
+
+    const parsed = JSON.parse(msg) as { type: string; depth: number; cards: Array<{ id: string }> };
+    expect(parsed.type).toBe('queue_update');
+    expect(parsed.depth).toBe(1);
+    expect(parsed.cards).toHaveLength(1);
+  });
+
+  it('WebSocket receives live updates when queue changes', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-013-ws-live-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+    wsUrl = `ws://127.0.0.1:${port}`;
+
+    // Get a card first
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+
+    // Connect WS and collect messages
+    const ws = new WebSocket(wsUrl);
+    const messages: string[] = [];
+
+    await new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        messages.push(data.toString());
+        // After initial state, make a decision to trigger update
+        if (messages.length === 1) {
+          fetch(`${url}/card/${goal.id}/decision`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ decision: 'reject' }),
+          });
+        }
+        if (messages.length >= 2) resolve();
+      });
+    });
+    ws.close();
+
+    // First message: initial state with 1 card
+    const initial = JSON.parse(messages[0]) as { depth: number };
+    expect(initial.depth).toBe(1);
+
+    // Second message: queue update after reject — 0 cards
+    const updated = JSON.parse(messages[1]) as { depth: number };
+    expect(updated.depth).toBe(0);
+  });
+
+  it('multiple WS clients receive the same broadcast', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-013-ws-multi-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+    wsUrl = `ws://127.0.0.1:${port}`;
+
+    // Get a card
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+
+    // Connect two clients
+    const ws1 = new WebSocket(wsUrl);
+    const ws2 = new WebSocket(wsUrl);
+
+    // Wait for both to get initial state
+    const [init1, init2] = await Promise.all([
+      new Promise<string>((r) => ws1.on('message', (d) => r(d.toString()))),
+      new Promise<string>((r) => ws2.on('message', (d) => r(d.toString()))),
+    ]);
+
+    // Both should receive the same initial state
+    expect(JSON.parse(init1).depth).toBe(1);
+    expect(JSON.parse(init2).depth).toBe(1);
+
+    // Now make a decision and wait for both to get the update
+    const [upd1Promise, upd2Promise] = [
+      new Promise<string>((r) => ws1.on('message', (d) => r(d.toString()))),
+      new Promise<string>((r) => ws2.on('message', (d) => r(d.toString()))),
+    ];
+
+    await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'reject' }),
+    });
+
+    const [upd1, upd2] = await Promise.all([upd1Promise, upd2Promise]);
+    expect(JSON.parse(upd1).depth).toBe(0);
+    expect(JSON.parse(upd2).depth).toBe(0);
+
+    ws1.close();
+    ws2.close();
+  });
+
+  it('WebSocket updates include card details for TUI rendering', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-013-ws-details-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'alice@example.com', subject: 'hello', body: 'body', unread: true },
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: trivialPlan,
+      getRules: () => EMPTY_RULES,
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    wsUrl = `ws://127.0.0.1:${port}`;
+
+    // Trigger refill
+    await fetch(`http://127.0.0.1:${port}/refill`, { method: 'POST' });
+
+    const ws = new WebSocket(wsUrl);
+    const msg = await new Promise<string>((r) => ws.on('message', (d) => r(d.toString())));
+    ws.close();
+
+    const parsed = JSON.parse(msg) as { cards: Array<{ id: string; title: string; reason: string; transport: string; action: string; messageId: string }> };
+    const card = parsed.cards[0];
+    expect(card.title).toBeDefined();
+    expect(card.reason).toBeDefined();
+    expect(card.transport).toBe('gmail');
+    expect(card.action).toBe('archive');
+    expect(card.messageId).toBe('m1');
   });
 });

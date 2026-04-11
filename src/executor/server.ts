@@ -16,6 +16,7 @@ import { detectAnomalies } from '../verifier.js';
 import { readJournal } from '../journal.js';
 import { detectPromotions } from '../promoter.js';
 import { checkCredentialScopes, type CredentialResolver } from '../credentials.js';
+import { WebSocketServer, type WebSocket } from 'ws';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -89,6 +90,23 @@ export function createExecutorServer(deps: ServerDeps): Server {
   /** Track goal IDs already surfaced as meta-cards to avoid duplicates. */
   const metaCardGoalIds = new Set<string>();
   let verifierTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Connected WebSocket clients for live updates. */
+  const wsClients = new Set<WebSocket>();
+  function broadcastQueueUpdate(): void {
+    const msg = JSON.stringify({
+      type: 'queue_update',
+      depth: queue.length,
+      cards: queue.map((c) => ({
+        ...c.goal,
+        breakdown: c.breakdown,
+        exploration: c.exploration,
+      })),
+    });
+    for (const ws of wsClients) {
+      try { ws.send(msg); } catch { wsClients.delete(ws); }
+    }
+  }
 
   /** Run the post-hoc verifier: detect anomalies and insert meta-cards. */
   async function runVerifier(): Promise<void> {
@@ -342,6 +360,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
       }
     } finally {
       refilling = false;
+      broadcastQueueUpdate();
     }
   }
 
@@ -359,7 +378,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
     res.end(body);
   }
 
-  return createServer(async (req, res) => {
+  const httpServer = createServer(async (req, res) => {
     try {
       const url = req.url ?? '/';
       if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
@@ -436,6 +455,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
             } else {
               queuedMessageIds.delete(card.message.id);
             }
+            broadcastQueueUpdate();
             send(res, 403, JSON.stringify({ error: 'blocked', reason: gate.reason }));
             return;
           }
@@ -477,6 +497,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
               action: card.goal.action,
               reason: 'irreversible action requires re-approval',
             });
+            broadcastQueueUpdate();
             send(res, 200, JSON.stringify({ ok: true, halted: true, reApprovalId: reApprovalGoal.id }));
             return;
           }
@@ -496,6 +517,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
             });
             queue.splice(idx, 1);
             queuedMessageIds.delete(card.message.id);
+            broadcastQueueUpdate();
             send(res, 403, JSON.stringify({ error: 'credential_refused', reason: credCheck.reason }));
             return;
           }
@@ -545,6 +567,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
             for (const msgId of messageIds) {
               queuedMessageIds.delete(msgId);
             }
+            broadcastQueueUpdate();
             send(res, 200, JSON.stringify({
               ok: true,
               outcomes,
@@ -581,6 +604,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
 
             queue.splice(idx, 1);
             queuedMessageIds.delete(card.message.id);
+            broadcastQueueUpdate();
             send(res, 200, JSON.stringify({
               ok: true,
               outcomes: [outcome],
@@ -617,6 +641,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
 
             queue.splice(idx, 1);
             queuedMessageIds.delete(card.message.id);
+            broadcastQueueUpdate();
             send(res, 200, JSON.stringify({
               ok: true,
               outcomes: [outcome],
@@ -656,6 +681,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
             });
           }
           queue.splice(idx, 1);
+          broadcastQueueUpdate();
           send(res, 200, JSON.stringify({ ok: true }));
           return;
         }
@@ -674,6 +700,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
         } else {
           queuedMessageIds.delete(card.message.id);
         }
+        broadcastQueueUpdate();
         send(res, 200, JSON.stringify({ ok: true }));
         return;
       }
@@ -724,6 +751,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
           anomalyType: 'user_flagged_wrong',
           metaCardId: metaId,
         });
+        broadcastQueueUpdate();
         send(res, 200, JSON.stringify({ ok: true, metaCardId: metaId }));
         return;
       }
@@ -731,6 +759,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
       // POST /verifier/run — manually trigger the verifier (for tests and debugging)
       if (req.method === 'POST' && url === '/verifier/run') {
         await runVerifier();
+        broadcastQueueUpdate();
         send(res, 200, JSON.stringify({ ok: true, queueDepth: queue.length }));
         return;
       }
@@ -738,6 +767,7 @@ export function createExecutorServer(deps: ServerDeps): Server {
       // POST /promoter/run — manually trigger the rule promoter (for tests and debugging)
       if (req.method === 'POST' && url === '/promoter/run') {
         await runPromoter();
+        broadcastQueueUpdate();
         send(res, 200, JSON.stringify({ ok: true, queueDepth: queue.length }));
         return;
       }
@@ -747,4 +777,24 @@ export function createExecutorServer(deps: ServerDeps): Server {
       send(res, 500, JSON.stringify({ error: (err as Error).message }));
     }
   });
+
+  // Attach WebSocket server for live updates
+  const wss = new WebSocketServer({ server: httpServer });
+  wss.on('connection', (ws) => {
+    wsClients.add(ws);
+    ws.on('close', () => wsClients.delete(ws));
+    ws.on('error', () => wsClients.delete(ws));
+    // Send current queue state on connect
+    ws.send(JSON.stringify({
+      type: 'queue_update',
+      depth: queue.length,
+      cards: queue.map((c) => ({
+        ...c.goal,
+        breakdown: c.breakdown,
+        exploration: c.exploration,
+      })),
+    }));
+  });
+
+  return httpServer;
 }

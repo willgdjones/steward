@@ -2,6 +2,13 @@
 
 ## 2026-04-11
 
+### Slice 013 — terminal client and WebSocket live updates
+- Added WebSocket server to executor for live queue updates. All connected clients receive `queue_update` messages whenever the queue changes (decisions, refills, verifier/promoter runs).
+- `src/executor/server.ts`: `WebSocketServer` (ws library) attached to the HTTP server. Broadcasts after every queue mutation. New clients receive current queue state on connect.
+- `src/tui.ts` (NEW): terminal client with `j`/`k` navigation, `y`/`n`/`d` for approve/reject/defer, `q` to quit. Renders cards with title, reason, transport/action, irreversible badge. Connects via WebSocket for live updates, reconnects on disconnect.
+- `package.json`: added `ws` dependency, `@types/ws` dev dependency, `tui` script.
+- 145 tests across 12 files; 4 new WebSocket e2e tests covering initial state on connect, live updates on decision, multi-client broadcast, and card detail rendering.
+
 ### Slice 012 — send_draft and 1Password credential gating
 - Added `send_draft` capability to the Gmail sub-agent: sends an existing draft, verifies it was sent, declared irreversible in principles.md.
 - `src/gmail/fake.ts`: added `sendDraft()` method and `sent` field on `GmailDraft`.
