@@ -11,6 +11,7 @@ import { redact } from '../src/redactor.js';
 import { loadRules, type Rules } from '../src/rules.js';
 import type { JournalEntry } from '../src/journal.js';
 import WebSocket from 'ws';
+import { createFakeBrowserSubAgent } from '../src/browser/subagent.js';
 
 const EMPTY_RULES: Rules = {
   blacklist: [],
@@ -2521,5 +2522,143 @@ describe('slice 013 terminal client and websocket', () => {
     expect(card.transport).toBe('gmail');
     expect(card.action).toBe('archive');
     expect(card.messageId).toBe('m1');
+  });
+});
+
+describe('slice 014 browser sub-agent read-only', () => {
+  let dir: string;
+  let url: string;
+  let server: ReturnType<typeof createExecutorServer>;
+
+  afterEach(async () => {
+    if (server) await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('browser_read action dispatches to browser sub-agent and journals outcome', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-014-browser-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'billing@example.com', subject: 'Invoice', body: 'See invoice at https://example.com/invoice', unread: true },
+    ]);
+
+    const browserResponses = new Map([
+      ['https://example.com/invoice', { title: 'Invoice #1234', text: 'Amount due: £250.00\nDue date: 2026-05-01' }],
+    ]);
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => {
+        const goal = {
+          id: 'g-m1',
+          title: 'Extract invoice amount from billing page',
+          reason: 'Need to verify the invoice amount',
+          messageId: 'm1',
+          transport: 'browser',
+          action: 'browser_read',
+        };
+        (goal as unknown as Record<string, unknown>).targetUrl = 'https://example.com/invoice';
+        return goal;
+      },
+      getRules: () => ({
+        ...EMPTY_RULES,
+        reversibility: [{ action: 'browser_read', reversible: true }],
+      }),
+      browserSubAgent: createFakeBrowserSubAgent(browserResponses),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    // Get card and approve
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string; transport: string; action: string };
+    expect(goal.transport).toBe('browser');
+    expect(goal.action).toBe('browser_read');
+
+    const decRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const decBody = (await decRes.json()) as {
+      ok: boolean;
+      outcomes: Array<{ success: boolean; pageTitle: string; textContent: string }>;
+      verification: { verified: boolean };
+    };
+    expect(decBody.ok).toBe(true);
+    expect(decBody.outcomes[0].success).toBe(true);
+    expect(decBody.outcomes[0].pageTitle).toBe('Invoice #1234');
+    expect(decBody.outcomes[0].textContent).toContain('£250.00');
+    expect(decBody.verification.verified).toBe(true);
+
+    // Journal should record the browser action
+    const journal = readFileSync(join(dir, 'journal.jsonl'), 'utf8').trim().split('\n');
+    const entry = JSON.parse(journal[journal.length - 1]);
+    expect(entry.kind).toBe('action');
+    expect(entry.transport).toBe('browser');
+    expect(entry.action).toBe('browser_read');
+  });
+
+  it('browser_read is read-only — only browser_read capability is accepted', async () => {
+    const browserResponses = new Map<string, { title: string; text: string }>();
+    const agent = createFakeBrowserSubAgent(browserResponses);
+
+    // Trying to use a write capability should fail
+    const outcome = await agent.dispatch({
+      capability: 'browser_write' as 'browser_read',
+      url: 'https://example.com',
+      instruction: 'Submit the form',
+    });
+    expect(outcome.success).toBe(false);
+    expect(outcome.error).toContain('unknown capability');
+  });
+
+  it('browser sub-agent failure is handled gracefully', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steward-014-browser-fail-'));
+    const gmail = new FakeGmail(join(dir, 'fake_inbox.json'));
+    gmail.save([
+      { id: 'm1', from: 'test@example.com', subject: 'test', body: 'body', unread: true },
+    ]);
+
+    // Empty responses map — URL won't be found
+    const browserResponses = new Map<string, { title: string; text: string }>();
+
+    server = createExecutorServer({
+      gmail,
+      journalPath: join(dir, 'journal.jsonl'),
+      plan: async () => {
+        const goal = {
+          id: 'g-m1',
+          title: 'Read unknown page',
+          reason: 'Test',
+          messageId: 'm1',
+          transport: 'browser',
+          action: 'browser_read',
+        };
+        (goal as unknown as Record<string, unknown>).targetUrl = 'https://unknown.example.com';
+        return goal;
+      },
+      getRules: () => EMPTY_RULES,
+      browserSubAgent: createFakeBrowserSubAgent(browserResponses),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const { port } = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${port}`;
+
+    const cardRes = await fetch(`${url}/card`);
+    const goal = (await cardRes.json()) as { id: string };
+    const decRes = await fetch(`${url}/card/${goal.id}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    const decBody = (await decRes.json()) as {
+      ok: boolean;
+      outcomes: Array<{ success: boolean; error: string }>;
+    };
+    expect(decBody.ok).toBe(true);
+    expect(decBody.outcomes[0].success).toBe(false);
+    expect(decBody.outcomes[0].error).toContain('no canned response');
   });
 });

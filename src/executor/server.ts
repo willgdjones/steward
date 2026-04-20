@@ -17,6 +17,7 @@ import { readJournal } from '../journal.js';
 import { detectPromotions } from '../promoter.js';
 import { checkCredentialScopes, type CredentialResolver } from '../credentials.js';
 import { WebSocketServer, type WebSocket } from 'ws';
+import type { BrowserSubAgent } from '../browser/subagent.js';
 
 export type Decision = 'approve' | 'reject' | 'defer';
 
@@ -33,6 +34,8 @@ export interface ServerDeps {
   searchQuery?: string;
   /** Directory containing rules files (principles.md, gmail.md). Needed for rule promotion writes. */
   rulesDir?: string;
+  /** Browser sub-agent for read-only web extraction. */
+  browserSubAgent?: BrowserSubAgent;
   /** Credential resolver for op:// references. If omitted, credential checks are skipped. */
   credentialResolver?: CredentialResolver;
 }
@@ -649,6 +652,40 @@ export function createExecutorServer(deps: ServerDeps): Server {
             }));
             return;
           }
+        }
+
+        // Handle browser_read action
+        if (decision === 'approve' && card.goal.transport === 'browser' && card.goal.action === 'browser_read' && deps.browserSubAgent) {
+          const goalExtras = card.goal as unknown as Record<string, unknown>;
+          const browserInstruction = {
+            capability: 'browser_read' as const,
+            url: (goalExtras.targetUrl as string) ?? '',
+            instruction: card.goal.title,
+            selector: goalExtras.selector as string | undefined,
+          };
+          const outcome = await deps.browserSubAgent.dispatch(browserInstruction);
+          const verification = await deps.browserSubAgent.verify(browserInstruction.url);
+
+          appendJournal(deps.journalPath, {
+            kind: 'action',
+            goalId: card.goal.id,
+            messageId: card.message.id,
+            title: card.goal.title,
+            transport: 'browser',
+            action: 'browser_read',
+            outcomes: [outcome],
+            verification: { verified: verification.verified, actual_url: verification.actual_url },
+          });
+
+          queue.splice(idx, 1);
+          queuedMessageIds.delete(card.message.id);
+          broadcastQueueUpdate();
+          send(res, 200, JSON.stringify({
+            ok: true,
+            outcomes: [outcome],
+            verification: { verified: verification.verified, actual_url: verification.actual_url },
+          }));
+          return;
         }
 
         // Handle promotion meta-card decisions

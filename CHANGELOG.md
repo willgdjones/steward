@@ -2,6 +2,13 @@
 
 ## 2026-04-11
 
+### Slice 014 — browser sub-agent (read-only)
+- Registered `browser` as a second sub-agent capability, restricted to read-only page extraction. Inspired by browser-harness-js: direct CDP, "the protocol is the API."
+- `src/browser/cdp.ts` (NEW): minimal CDP client over WebSocket. Connect, navigate, evaluate JS, get page content/title/URL. No framework, one WebSocket to Chrome.
+- `src/browser/subagent.ts` (NEW): `BrowserSubAgent` interface (dispatch + verify) following the same contract as `GmailSubAgent`. Only `browser_read` capability accepted — no form submits, no clicks on irreversible elements. `createFakeBrowserSubAgent()` for testing with canned responses.
+- `src/executor/server.ts`: wired `browser_read` dispatch path. Goals with `transport: 'browser'` and `action: 'browser_read'` dispatch to the browser sub-agent. Verification re-fetches the URL. Journal records instruction and outcome.
+- 153 tests across 13 files; 8 new tests covering browser dispatch/verify, read-only enforcement, failure handling, and executor integration.
+
 ### Slice 013 — terminal client and WebSocket live updates
 - Added WebSocket server to executor for live queue updates. All connected clients receive `queue_update` messages whenever the queue changes (decisions, refills, verifier/promoter runs).
 - `src/executor/server.ts`: `WebSocketServer` (ws library) attached to the HTTP server. Broadcasts after every queue mutation. New clients receive current queue state on connect.
