@@ -3,3 +3,29 @@ state/
 *.log
 .DS_Store
 dist
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+credentials.json
+*.pem
+*.key
+
+# 1Password references are fine (op:// URIs), but never actual tokens
+secrets/
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build
+*.tsbuildinfo
