@@ -15,6 +15,7 @@ from steward.rules import (
     PromotionConfig,
     QueueConfig,
     Rules,
+    SpendingLimits,
     VerifierConfig,
 )
 
@@ -30,6 +31,7 @@ def empty_rules(**overrides) -> Rules:
         credential_scopes=[],
         verifier=VerifierConfig(interval_minutes=60),
         promotion=PromotionConfig(threshold=5, cooldown_minutes=1440, interval_minutes=120),
+        spending_limits=SpendingLimits(),
     )
     for k, v in overrides.items():
         setattr(r, k, v)

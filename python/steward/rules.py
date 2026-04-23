@@ -59,6 +59,16 @@ class CredentialScopeDecl:
 
 
 @dataclass
+class SpendingLimits:
+    """Per-payment-class limits enforced by the executor before dispatch.
+    Amounts are minor units (pence). None means no limit (issuer-side limit
+    is still active as a second defence layer)."""
+    max_per_charge_pence: int | None = None
+    max_per_day_pence: int | None = None
+    max_per_week_pence: int | None = None
+
+
+@dataclass
 class Rules:
     blacklist: list[BlacklistEntry] = field(default_factory=list)
     redaction: list[RedactionRule] = field(default_factory=list)
@@ -69,6 +79,7 @@ class Rules:
     credential_scopes: list[CredentialScopeDecl] = field(default_factory=list)
     verifier: VerifierConfig = field(default_factory=VerifierConfig)
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
+    spending_limits: SpendingLimits = field(default_factory=SpendingLimits)
 
 
 def _load_file(path: Path) -> dict[str, Any] | None:
@@ -147,6 +158,13 @@ def load_rules(directory: str | Path) -> Rules:
             )
         )
 
+    spending_raw = principles.get("spending_limits") or {}
+    spending_limits = SpendingLimits(
+        max_per_charge_pence=spending_raw.get("max_per_charge_pence"),
+        max_per_day_pence=spending_raw.get("max_per_day_pence"),
+        max_per_week_pence=spending_raw.get("max_per_week_pence"),
+    )
+
     return Rules(
         blacklist=blacklist,
         redaction=redaction,
@@ -157,6 +175,7 @@ def load_rules(directory: str | Path) -> Rules:
         credential_scopes=credential_scopes,
         verifier=verifier,
         promotion=promotion,
+        spending_limits=spending_limits,
     )
 
 

@@ -18,6 +18,8 @@ from steward.credentials import CredentialResolver, check_credential_scopes
 from steward.gmail.fake import FakeGmail
 from steward.gmail.subagent import GmailSubAgent, create_gmail_sub_agent
 from steward.journal import append_journal, read_journal
+from steward.payments.limits import check_spending_limits
+from steward.payments.subagent import PaymentsSubAgent
 from steward.planner import Goal, PlannerInput
 from steward.principles_gate import check_blacklist
 from steward.promoter import Promotion, detect_promotions
@@ -75,6 +77,7 @@ class ServerDeps:
     search_query: str = "is:unread"
     rules_dir: str | None = None
     browser_sub_agent: BrowserSubAgent | None = None
+    payments_sub_agent: PaymentsSubAgent | None = None
     credential_resolver: CredentialResolver | None = None
 
 
@@ -524,8 +527,44 @@ class ExecutorServer:
                 await self._broadcast_queue_update()
                 return web.json_response({"error": "blocked", "reason": gate.reason}, status=403)
 
+        # Spending-limits check — payments transport only, before we resolve
+        # any credential or call the issuer. Irreversible actions must not
+        # reach the issuer if they'd breach the per-charge or per-day cap.
+        if decision == "approve" and transport == "payments" and action == "charge":
+            rules = self.deps.get_rules()
+            limits = rules.spending_limits
+            requested = goal.get("amount_pence")
+            if not isinstance(requested, int):
+                return web.json_response(
+                    {"error": "invalid_charge", "reason": f"amount_pence must be int, got {type(requested).__name__}"},
+                    status=400,
+                )
+            limit_check = check_spending_limits(
+                requested,
+                read_journal(self.deps.journal_path),
+                max_per_charge_pence=limits.max_per_charge_pence,
+                max_per_day_pence=limits.max_per_day_pence,
+                max_per_week_pence=limits.max_per_week_pence,
+            )
+            if not limit_check.allowed:
+                append_journal(self.deps.journal_path, {
+                    "kind": "limit_exceeded",
+                    "goalId": goal.get("id"),
+                    "messageId": card.message.get("id"),
+                    "action": action,
+                    "amount_pence": requested,
+                    "reason": limit_check.reason,
+                })
+                self.queue.pop(idx)
+                self.queued_message_ids.discard(card.message.get("id", ""))
+                await self._broadcast_queue_update()
+                return web.json_response(
+                    {"error": "limit_exceeded", "reason": limit_check.reason},
+                    status=403,
+                )
+
         # Irreversibility halt
-        if decision == "approve" and transport == "gmail" and action and not card.re_approval:
+        if decision == "approve" and transport in ("gmail", "payments") and action and not card.re_approval:
             rules = self.deps.get_rules()
             decl = next((r for r in rules.reversibility if r.action == action), None)
             if decl and not decl.reversible:
@@ -537,7 +576,9 @@ class ExecutorServer:
                     "transport": transport,
                     "action": action,
                 }
-                for key in ("draftId", "draftBody", "messageIds", "batchSize"):
+                for key in ("draftId", "draftBody", "messageIds", "batchSize",
+                            "amount_pence", "currency", "payee", "cardRef",
+                            "idempotencyKey"):
                     if key in goal:
                         re_goal[key] = goal[key]
                 re_card = CardState(
@@ -562,7 +603,7 @@ class ExecutorServer:
         # Credential scope check — applies to any transport that declares scopes
         if (
             decision == "approve"
-            and transport in ("gmail", "browser")
+            and transport in ("gmail", "browser", "payments")
             and action
             and self.deps.credential_resolver
         ):
@@ -599,6 +640,10 @@ class ExecutorServer:
                 return await self._dispatch_browser_read(idx, card)
             if action == "browser_authenticated_read":
                 return await self._dispatch_browser_authenticated_read(idx, card)
+
+        # Payments dispatch — charge (irreversible; halt gate enforced above)
+        if decision == "approve" and transport == "payments" and action == "charge" and self.deps.payments_sub_agent:
+            return await self._dispatch_charge(idx, card)
 
         # Promotion meta-card
         promotion_data = goal.get("promotionData")
@@ -891,6 +936,65 @@ class ExecutorServer:
                 "verified": verification.get("verified", False),
                 "actual_url": verification.get("actual_url", ""),
             },
+        })
+
+    async def _dispatch_charge(self, idx: int, card: CardState) -> web.Response:
+        """Dispatch a charge via the payments sub-agent.
+
+        Spending limits and credential scope are already checked by the time
+        we get here. The card ref is an `op://` string — we do NOT resolve it
+        locally (the sub-agent is responsible at the moment of the real
+        issuer API call; the fake provider stores the ref as-is).
+        """
+        goal = card.goal
+        amount = goal.get("amount_pence")
+        currency = goal.get("currency", "GBP")
+        payee = goal.get("payee", "")
+        card_ref = goal.get("cardRef", "")
+        idempotency_key = goal.get("idempotencyKey") or goal.get("id")
+
+        instruction = {
+            "capability": "charge",
+            "amount_pence": amount,
+            "currency": currency,
+            "payee": payee,
+            "card_ref": card_ref,
+            "idempotency_key": idempotency_key,
+        }
+        outcome = await self.deps.payments_sub_agent.dispatch(instruction)  # type: ignore[union-attr]
+
+        charge_id = outcome.get("charge_id") if outcome.get("success") else None
+        if charge_id:
+            verification = await self.deps.payments_sub_agent.verify(  # type: ignore[union-attr]
+                charge_id,
+                expected_amount_pence=int(amount),
+                expected_payee=payee,
+            )
+        else:
+            verification = {"verified": False, "actual_state": "not_attempted"}
+
+        append_journal(self.deps.journal_path, {
+            "kind": "action",
+            "goalId": goal.get("id"),
+            "messageId": card.message.get("id"),
+            "title": goal.get("title"),
+            "transport": "payments",
+            "action": "charge",
+            "cardRef": card_ref,
+            "currency": currency,
+            "payee": payee,
+            "amount_pence": amount,
+            "outcomes": [outcome],
+            "verification": verification,
+            **self._replay_context(card),
+        })
+        self.queue.pop(idx)
+        self.queued_message_ids.discard(card.message.get("id", ""))
+        await self._broadcast_queue_update()
+        return web.json_response({
+            "ok": True,
+            "outcomes": [outcome],
+            "verification": verification,
         })
 
     async def _websocket(self, request: web.Request) -> web.WebSocketResponse:
