@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-04-23
+
+### Python port — parity with TS through slice 014
+- Full port of steward from Node/TypeScript to Python, landed side-by-side in `python/`. Motivated by a preference for Python and compatibility with `browser-use/browser-harness` (Python-only).
+- Stack: Python 3.12+, aiohttp (HTTP + WebSocket in one stack), anthropic SDK, pyyaml, websockets, pytest + pytest-asyncio, managed via `uv`.
+- Modules ported 1:1: `journal`, `redactor`, `rules` (YAML loader + poll-based watcher), `principles_gate`, `credentials`, `triage`, `ranker` (learned weights, floor reservations, exploration slots), `batcher`, `verifier`, `promoter`, `gmail/fake`, `gmail/subagent`, `browser/subagent` (fake only — CDP deferred), `planner`, `executor/server` + `executor/__main__`, `executor/planner_client` with env sanitisation, `tui` (aiohttp WebSocket client with termios raw input).
+- Wire-compat: JSON field names preserved exactly (`messageId`, `draftId`, `fromDomain`, `batchSize`, etc.) so the Python executor speaks the same protocol as the TS one. Journal format identical.
+- Tests: 152 pytest tests across 21 files, covering all behaviours from the 153-test TS suite (one TS test collapsed into a dataclass equality assertion). All green.
+- TS tree (`src/`, `tests/`) retained as legacy reference; will be removed once the Python path proves out.
+
 ## 2026-04-11
 
 ### Slice 014 — browser sub-agent (read-only)
