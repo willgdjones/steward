@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import WSMsgType, web
 
 from steward.batcher import Cluster, TriagedCandidate, cluster_candidates
+from steward.browser.redactor import redact_browser_outcome
 from steward.browser.subagent import BrowserSubAgent
 from steward.credentials import CredentialResolver, check_credential_scopes
 from steward.gmail.fake import FakeGmail
@@ -536,8 +537,13 @@ class ExecutorServer:
                 await self._broadcast_queue_update()
                 return web.json_response({"ok": True, "halted": True, "reApprovalId": re_goal["id"]})
 
-        # Credential scope check
-        if decision == "approve" and transport == "gmail" and action and self.deps.credential_resolver:
+        # Credential scope check — applies to any transport that declares scopes
+        if (
+            decision == "approve"
+            and transport in ("gmail", "browser")
+            and action
+            and self.deps.credential_resolver
+        ):
             rules = self.deps.get_rules()
             cred = check_credential_scopes(action, rules.credential_scopes, self.deps.credential_resolver)
             if not cred.allowed:
@@ -565,9 +571,12 @@ class ExecutorServer:
             if action == "send_draft":
                 return await self._dispatch_send_draft(idx, card)
 
-        # Browser read dispatch
-        if decision == "approve" and transport == "browser" and action == "browser_read" and self.deps.browser_sub_agent:
-            return await self._dispatch_browser_read(idx, card)
+        # Browser dispatch — read (public) and authenticated read (credential-gated)
+        if decision == "approve" and transport == "browser" and self.deps.browser_sub_agent:
+            if action == "browser_read":
+                return await self._dispatch_browser_read(idx, card)
+            if action == "browser_authenticated_read":
+                return await self._dispatch_browser_authenticated_read(idx, card)
 
         # Promotion meta-card
         promotion_data = goal.get("promotionData")
@@ -750,6 +759,98 @@ class ExecutorServer:
             "ok": True,
             "outcomes": [outcome],
             "verification": {"verified": verification["verified"], "actual_url": verification["actual_url"]},
+        })
+
+    async def _dispatch_browser_authenticated_read(self, idx: int, card: CardState) -> web.Response:
+        """Resolve op:// credentials, fill-and-extract via the sub-agent, redact, journal.
+
+        Resolved credentials are bound only to this method's local scope and the
+        sub-agent dispatch argument. They are NEVER passed to the planner, journal,
+        HTTP response body, or WebSocket broadcast — the redactor is the final
+        guard, applied before we emit anything.
+
+        Note: this slice declares `browser_authenticated_read` reversible. Login
+        submit has minimal server-side effect (session creation), so that's
+        defensible for read-after-login. A separate irreversible capability for
+        actual writes (submit payment, send message via form) comes later.
+        """
+        goal = card.goal
+        resolver = self.deps.credential_resolver
+        if resolver is None:
+            return web.json_response(
+                {"error": "no_credential_resolver", "reason": "authenticated read requires a credential resolver"},
+                status=500,
+            )
+
+        username_ref = goal.get("usernameRef")
+        password_ref = goal.get("passwordRef")
+        target_url = goal.get("targetUrl", "")
+
+        try:
+            resolved_username = resolver.resolve(username_ref) if username_ref else ""
+            resolved_password = resolver.resolve(password_ref) if password_ref else ""
+        except Exception as e:
+            append_journal(self.deps.journal_path, {
+                "kind": "credential_refused",
+                "goalId": goal.get("id"),
+                "messageId": card.message.get("id"),
+                "action": "browser_authenticated_read",
+                "reason": str(e),
+            })
+            self.queue.pop(idx)
+            self.queued_message_ids.discard(card.message.get("id", ""))
+            await self._broadcast_queue_update()
+            return web.json_response(
+                {"error": "credential_refused", "reason": str(e)},
+                status=403,
+            )
+
+        resolved_creds = [resolved_username, resolved_password]
+
+        instruction = {
+            "capability": "browser_authenticated_read",
+            "login_url": goal.get("loginUrl", ""),
+            "target_url": target_url,
+            "username_selector": goal.get("usernameSelector", ""),
+            "password_selector": goal.get("passwordSelector", ""),
+            "submit_selector": goal.get("submitSelector", ""),
+            "extraction_instruction": goal.get("title", ""),
+            "selector": goal.get("selector"),
+            "resolved_creds": resolved_creds,
+        }
+
+        raw_outcome = await self.deps.browser_sub_agent.dispatch(instruction)
+        outcome = redact_browser_outcome(raw_outcome, resolved_creds)
+
+        raw_verification = await self.deps.browser_sub_agent.verify(target_url)
+        verification = redact_browser_outcome(raw_verification, resolved_creds)
+
+        append_journal(self.deps.journal_path, {
+            "kind": "action",
+            "goalId": goal.get("id"),
+            "messageId": card.message.get("id"),
+            "title": goal.get("title"),
+            "transport": "browser",
+            "action": "browser_authenticated_read",
+            "usernameRef": username_ref,
+            "passwordRef": password_ref,
+            "targetUrl": target_url,
+            "outcomes": [outcome],
+            "verification": {
+                "verified": verification.get("verified", False),
+                "actual_url": verification.get("actual_url", ""),
+            },
+        })
+        self.queue.pop(idx)
+        self.queued_message_ids.discard(card.message.get("id", ""))
+        await self._broadcast_queue_update()
+        return web.json_response({
+            "ok": True,
+            "outcomes": [outcome],
+            "verification": {
+                "verified": verification.get("verified", False),
+                "actual_url": verification.get("actual_url", ""),
+            },
         })
 
     async def _websocket(self, request: web.Request) -> web.WebSocketResponse:
