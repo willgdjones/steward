@@ -2,6 +2,16 @@
 
 ## 2026-04-23
 
+### Slice 016 — payments capability (fake provider; HITL pending)
+- New `payments` transport with `charge` action. Declared irreversible — rides the existing halt machinery (slice 011), so every approve goes through a re-approval card showing amount + payee + card ref before the charge fires.
+- `steward/payments/fake.py` (NEW): `FakePaymentProvider` — in-memory charge store with idempotency-key dedup and injectable issuer-failure for tests. Real Stripe Issuing adapter (or similar) is a separate slice; same `charge` / `get_charge` surface keeps the swap local.
+- `steward/payments/subagent.py` (NEW): `FakePaymentsSubAgent` with `dispatch` + `verify`. Amounts are int minor units (pence) — no floats for money. Verify re-fetches the charge and checks amount + payee + status all match.
+- `steward/payments/limits.py` (NEW): `check_spending_limits` — per-charge cap, per-day window, per-week window. Pure function over the journal so replay / test paths exercise it without the executor. Failed charges and non-charge entries are ignored in aggregation.
+- `steward/rules.py`: new `SpendingLimits` type and `spending_limits:` block in `principles.md`. All three caps optional; None means no deterministic cap (issuer-side card limit is still a second defence layer).
+- `steward/executor/server.py`: new `payments` dispatch path. Order of checks before a charge fires: blacklist → spending-limits → irreversibility halt → credential scope → dispatch → verify → journal. Re-approval cards now carry `amount_pence`, `currency`, `payee`, `cardRef`, `idempotencyKey` through the halt.
+- Tests: 32 new (5 fake provider, 9 sub-agent, 10 limits, 8 executor e2e). Total: 226 passing. Coverage includes per-charge / per-day / per-week caps, stale-entry exclusion from day window, journal never contains resolved `sk_` values (op:// refs stored instead), idempotency dedup, invalid-amount-type 400, vault-locked 403, ISO-timestamp fallback for pre-slice-016 entries.
+- HITL: end-to-end flow needs user review (acceptance criterion #7) before any real provider is wired up.
+
 ### Slice 020 — replay harness
 - `steward/replay.py` (NEW): `replay_entry`, `replay_journal`, `format_report`. Takes historical journal entries carrying planner-input context and re-runs the planner against them with current rules. Divergence = `transport` or `action` differs between historical and new; free-form title/reason deliberately ignored to tolerate LLM wording variance.
 - `steward/executor/server.py`: journal entries (kind: `decision` and `action`) now include `redactedMessage`, `snippet`, and `features` so replay can reconstruct the exact planner input. Added a `_replay_context(card)` helper; propagated via `**self._replay_context(card)` in every dispatch site (archive, draft_reply, send_draft, browser_read, browser_authenticated_read, generic decision). `CardState` carries `redacted_message` + `snippet` alongside `features`.
