@@ -2,6 +2,15 @@
 
 ## 2026-04-23
 
+### Slice 015 — authenticated browser sub-agent
+- New capability `browser_authenticated_read` on the browser sub-agent. Instruction carries `loginUrl`, `targetUrl`, `usernameRef`/`passwordRef` as `op://` references, plus form selectors. Declared reversible for pure read; submit-click side effects accepted as minimal.
+- `steward/browser/redactor.py` (NEW): defense-in-depth scrub of resolved credential values from browser outcome fields (`pageTitle`, `textContent`, `error`, `url`, `actual_url`, `actual_title`, `extracted`). Case-sensitive exact-match replacement. `MIN_CRED_LEN=4` skips short strings to avoid false positives. Module docstring enumerates accepted limitations (case variants, fragment leaks, screenshots not yet wired).
+- `steward/executor/server.py`: credential scope check now applies to browser transport (not just gmail). New `_dispatch_browser_authenticated_read`: resolves op:// refs at dispatch time in local scope only, calls sub-agent with `resolved_creds` bundle, redacts outcome before journal-write and HTTP response. Journal stores `usernameRef`/`passwordRef`/`targetUrl` for audit — never resolved values.
+- `steward/browser/harness.py` (NEW): `BrowserHarnessSubAgent` shells out to the `browser-harness` CLI with a generated Python script on stdin. Resolved credentials injected via env vars (`STEWARD_CRED_USERNAME`, `STEWARD_CRED_PASSWORD`) — never baked into the script text. Form fill uses selector-based JS with explicit `input`/`change` event dispatch (framework-safe); submit click is selector-based. Stdout parsed for a `STEWARD_RESULT:` sentinel line.
+- `steward/executor/__main__.py`: opt-in wiring via `STEWARD_BROWSER=harness` and `STEWARD_CREDENTIALS=op`. Default stays headless / Gmail-only, so no regressions for existing users.
+- 183 tests across 22 files (19 new): 8 for redactor coverage, 4 for the fake authenticated sub-agent, 6 executor e2e (happy path with redaction, locked vault short-circuits, verify re-fetches target, journal records refs not values), 13 for the browser-harness integration (script generation, result parsing, dispatch paths via injectable runner).
+- Live-browser integration is manual: with Chrome running and `browser-harness --setup` done, start the executor with `STEWARD_BROWSER=harness STEWARD_CREDENTIALS=op uv run python -m steward.executor`. Not exercised by pytest.
+
 ### Python port — parity with TS through slice 014
 - Full port of steward from Node/TypeScript to Python, landed side-by-side in `python/`. Motivated by a preference for Python and compatibility with `browser-use/browser-harness` (Python-only).
 - Stack: Python 3.12+, aiohttp (HTTP + WebSocket in one stack), anthropic SDK, pyyaml, websockets, pytest + pytest-asyncio, managed via `uv`.
