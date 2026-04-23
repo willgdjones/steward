@@ -2,6 +2,13 @@
 
 ## 2026-04-23
 
+### Slice 020 — replay harness
+- `steward/replay.py` (NEW): `replay_entry`, `replay_journal`, `format_report`. Takes historical journal entries carrying planner-input context and re-runs the planner against them with current rules. Divergence = `transport` or `action` differs between historical and new; free-form title/reason deliberately ignored to tolerate LLM wording variance.
+- `steward/executor/server.py`: journal entries (kind: `decision` and `action`) now include `redactedMessage`, `snippet`, and `features` so replay can reconstruct the exact planner input. Added a `_replay_context(card)` helper; propagated via `**self._replay_context(card)` in every dispatch site (archive, draft_reply, send_draft, browser_read, browser_authenticated_read, generic decision). `CardState` carries `redacted_message` + `snippet` alongside `features`.
+- CLI: `python -m steward.replay --journal PATH --rules-dir PATH --since ISO-DATE`. Exits non-zero on any divergence so the harness can sit in a CI gate for rule-change PRs.
+- 194 tests (11 new): divergence detection for action+transport changes, non-divergence for same output, unreplayable-entry skipping (missing redactedMessage/features, wrong kind), `--since` filtering, redaction rules applied at replay time (tightening rules round-trip correctly), action-kind entries replayable (not just decisions), report formatting.
+- Closes design.md §17's replay-harness bullet — the observability loop (journal → activity view → verifier → meta-cards → replay) is now end-to-end.
+
 ### Slice 015 — authenticated browser sub-agent
 - New capability `browser_authenticated_read` on the browser sub-agent. Instruction carries `loginUrl`, `targetUrl`, `usernameRef`/`passwordRef` as `op://` references, plus form selectors. Declared reversible for pure read; submit-click side effects accepted as minimal.
 - `steward/browser/redactor.py` (NEW): defense-in-depth scrub of resolved credential values from browser outcome fields (`pageTitle`, `textContent`, `error`, `url`, `actual_url`, `actual_title`, `extracted`). Case-sensitive exact-match replacement. `MIN_CRED_LEN=4` skips short strings to avoid false positives. Module docstring enumerates accepted limitations (case variants, fragment leaks, screenshots not yet wired).

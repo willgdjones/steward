@@ -88,6 +88,11 @@ class CardState:
     exploration: bool = False
     re_approval: bool = False
     original_goal: dict[str, Any] | None = None
+    # Planner inputs captured for the replay harness (slice 020). Optional so
+    # meta-cards and re-approval cards that don't round-trip through the planner
+    # leave these None.
+    redacted_message: dict[str, Any] | None = None
+    snippet: str | None = None
 
 
 class ExecutorServer:
@@ -110,6 +115,19 @@ class ExecutorServer:
             out["breakdown"] = card.breakdown
         out["exploration"] = card.exploration
         return out
+
+    def _replay_context(self, card: CardState) -> dict[str, Any]:
+        """Planner-input context attached to journal entries for the replay
+        harness (slice 020). Returns an empty dict for cards that didn't pass
+        through the planner (meta-cards, re-approval cards)."""
+        ctx: dict[str, Any] = {}
+        if card.features:
+            ctx["features"] = card.features
+        if card.redacted_message is not None:
+            ctx["redactedMessage"] = card.redacted_message
+        if card.snippet is not None:
+            ctx["snippet"] = card.snippet
+        return ctx
 
     def _queue_state(self) -> dict[str, Any]:
         return {
@@ -147,6 +165,8 @@ class ExecutorServer:
             goal=_goal_to_dict(goal),
             message=message,
             features=dict(triage_result.features),
+            redacted_message=dict(redacted),
+            snippet=triage_result.snippet,
         )
 
     async def _plan_and_enqueue(self, entry: TriagedCandidate) -> CardState:
@@ -161,6 +181,8 @@ class ExecutorServer:
             goal=_goal_to_dict(goal),
             message=entry.message,
             features=dict(entry.result.features),
+            redacted_message=dict(redacted),
+            snippet=entry.result.snippet,
         )
 
     def _make_batched_card(self, cluster: Cluster) -> CardState:
@@ -608,14 +630,21 @@ class ExecutorServer:
             return web.json_response({"ok": True})
 
         # Plain decision
-        append_journal(self.deps.journal_path, {
+        decision_entry: dict[str, Any] = {
             "kind": "decision",
             "decision": decision,
             "goalId": goal.get("id"),
             "messageId": card.message.get("id"),
             "title": goal.get("title"),
             "features": card.features,
-        })
+            "transport": goal.get("transport"),
+            "action": goal.get("action"),
+        }
+        if card.redacted_message is not None:
+            decision_entry["redactedMessage"] = card.redacted_message
+        if card.snippet is not None:
+            decision_entry["snippet"] = card.snippet
+        append_journal(self.deps.journal_path, decision_entry)
         self._remove_card_at(idx, card)
         await self._broadcast_queue_update()
         return web.json_response({"ok": True})
@@ -657,8 +686,11 @@ class ExecutorServer:
             "messageIds": message_ids,
             "batchSize": len(message_ids),
             "title": goal.get("title"),
+            "transport": "gmail",
+            "action": "archive",
             "outcomes": outcomes,
             "verification": {"verified": all_verified, "sample": verifications},
+            **self._replay_context(card),
         })
         self.queue.pop(idx)
         for mid in message_ids:
@@ -689,8 +721,11 @@ class ExecutorServer:
             "goalId": goal.get("id"),
             "messageId": card.message.get("id"),
             "title": goal.get("title"),
+            "transport": "gmail",
+            "action": "draft_reply",
             "outcomes": [outcome],
             "verification": {"verified": verification["verified"], "sample": [verification]},
+            **self._replay_context(card),
         })
         self.queue.pop(idx)
         self.queued_message_ids.discard(card.message.get("id", ""))
@@ -720,8 +755,11 @@ class ExecutorServer:
             "goalId": goal.get("id"),
             "messageId": card.message.get("id"),
             "title": goal.get("title"),
+            "transport": "gmail",
+            "action": "send_draft",
             "outcomes": [outcome],
             "verification": {"verified": verification["verified"], "sample": [verification]},
+            **self._replay_context(card),
         })
         self.queue.pop(idx)
         self.queued_message_ids.discard(card.message.get("id", ""))
@@ -751,6 +789,7 @@ class ExecutorServer:
             "action": "browser_read",
             "outcomes": [outcome],
             "verification": {"verified": verification["verified"], "actual_url": verification["actual_url"]},
+            **self._replay_context(card),
         })
         self.queue.pop(idx)
         self.queued_message_ids.discard(card.message.get("id", ""))
@@ -840,6 +879,7 @@ class ExecutorServer:
                 "verified": verification.get("verified", False),
                 "actual_url": verification.get("actual_url", ""),
             },
+            **self._replay_context(card),
         })
         self.queue.pop(idx)
         self.queued_message_ids.discard(card.message.get("id", ""))
