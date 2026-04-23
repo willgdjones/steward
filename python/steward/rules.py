@@ -95,7 +95,11 @@ def _load_file(path: Path) -> dict[str, Any] | None:
 def load_rules(directory: str | Path) -> Rules:
     d = Path(directory)
     principles = _load_file(d / "principles.md")
-    _load_file(d / "gmail.md")  # reserved for future per-surface rules
+    # Per-surface rules files — loaded for side-effect / future parsing; the
+    # executor writes to these (rule promotion) but doesn't yet read soft rules
+    # out of them. When it does, the shape will be per-transport.
+    _load_file(d / "gmail.md")
+    _load_file(d / "calendar.md")
 
     if not principles:
         return Rules()
@@ -189,9 +193,9 @@ def watch_rules(
     on_change: Callable[[Rules], None],
     poll_interval: float = 1.0,
 ) -> RulesWatcher:
-    """Simple polling watcher — reloads when principles.md or gmail.md mtime changes."""
+    """Simple polling watcher — reloads on principles.md / gmail.md / calendar.md changes."""
     d = Path(directory)
-    watched = [d / "principles.md", d / "gmail.md"]
+    watched = [d / "principles.md", d / "gmail.md", d / "calendar.md"]
     stop_event = threading.Event()
 
     def snapshot() -> tuple[float, ...]:

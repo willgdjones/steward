@@ -14,6 +14,7 @@ from aiohttp import WSMsgType, web
 from steward.batcher import Cluster, TriagedCandidate, cluster_candidates
 from steward.browser.redactor import redact_browser_outcome
 from steward.browser.subagent import BrowserSubAgent
+from steward.calendar.subagent import CalendarSubAgent
 from steward.credentials import CredentialResolver, check_credential_scopes
 from steward.gmail.fake import FakeGmail
 from steward.gmail.subagent import GmailSubAgent, create_gmail_sub_agent
@@ -78,6 +79,7 @@ class ServerDeps:
     rules_dir: str | None = None
     browser_sub_agent: BrowserSubAgent | None = None
     payments_sub_agent: PaymentsSubAgent | None = None
+    calendar_sub_agent: CalendarSubAgent | None = None
     credential_resolver: CredentialResolver | None = None
 
 
@@ -564,7 +566,7 @@ class ExecutorServer:
                 )
 
         # Irreversibility halt
-        if decision == "approve" and transport in ("gmail", "payments") and action and not card.re_approval:
+        if decision == "approve" and transport in ("gmail", "payments", "calendar") and action and not card.re_approval:
             rules = self.deps.get_rules()
             decl = next((r for r in rules.reversibility if r.action == action), None)
             if decl and not decl.reversible:
@@ -578,7 +580,9 @@ class ExecutorServer:
                 }
                 for key in ("draftId", "draftBody", "messageIds", "batchSize",
                             "amount_pence", "currency", "payee", "cardRef",
-                            "idempotencyKey"):
+                            "idempotencyKey",
+                            "eventId", "eventTitle", "eventStart", "eventEnd",
+                            "eventAttendees", "eventDescription"):
                     if key in goal:
                         re_goal[key] = goal[key]
                 re_card = CardState(
@@ -644,6 +648,15 @@ class ExecutorServer:
         # Payments dispatch — charge (irreversible; halt gate enforced above)
         if decision == "approve" and transport == "payments" and action == "charge" and self.deps.payments_sub_agent:
             return await self._dispatch_charge(idx, card)
+
+        # Calendar dispatch — read (reversible), create + decline (irreversible, halt above)
+        if decision == "approve" and transport == "calendar" and self.deps.calendar_sub_agent:
+            if action == "read":
+                return await self._dispatch_calendar_read(idx, card)
+            if action == "create":
+                return await self._dispatch_calendar_create(idx, card)
+            if action == "decline":
+                return await self._dispatch_calendar_decline(idx, card)
 
         # Promotion meta-card
         promotion_data = goal.get("promotionData")
@@ -984,6 +997,114 @@ class ExecutorServer:
             "currency": currency,
             "payee": payee,
             "amount_pence": amount,
+            "outcomes": [outcome],
+            "verification": verification,
+            **self._replay_context(card),
+        })
+        self.queue.pop(idx)
+        self.queued_message_ids.discard(card.message.get("id", ""))
+        await self._broadcast_queue_update()
+        return web.json_response({
+            "ok": True,
+            "outcomes": [outcome],
+            "verification": verification,
+        })
+
+    # ---------- calendar dispatch ----------
+
+    async def _dispatch_calendar_read(self, idx: int, card: CardState) -> web.Response:
+        goal = card.goal
+        instruction: dict[str, Any] = {"capability": "read"}
+        if goal.get("eventId"):
+            instruction["eventId"] = goal["eventId"]
+        outcome = await self.deps.calendar_sub_agent.dispatch(instruction)  # type: ignore[union-attr]
+        verification = await self.deps.calendar_sub_agent.verify(  # type: ignore[union-attr]
+            goal.get("eventId") or "",
+            "read",
+        )
+        append_journal(self.deps.journal_path, {
+            "kind": "action",
+            "goalId": goal.get("id"),
+            "messageId": card.message.get("id"),
+            "title": goal.get("title"),
+            "transport": "calendar",
+            "action": "read",
+            "eventId": goal.get("eventId"),
+            "outcomes": [outcome],
+            "verification": verification,
+            **self._replay_context(card),
+        })
+        self.queue.pop(idx)
+        self.queued_message_ids.discard(card.message.get("id", ""))
+        await self._broadcast_queue_update()
+        return web.json_response({
+            "ok": True,
+            "outcomes": [outcome],
+            "verification": verification,
+        })
+
+    async def _dispatch_calendar_create(self, idx: int, card: CardState) -> web.Response:
+        goal = card.goal
+        instruction = {
+            "capability": "create",
+            "title": goal.get("eventTitle") or goal.get("title"),
+            "start": goal.get("eventStart"),
+            "end": goal.get("eventEnd"),
+            "attendees": goal.get("eventAttendees"),
+            "description": goal.get("eventDescription"),
+        }
+        outcome = await self.deps.calendar_sub_agent.dispatch(instruction)  # type: ignore[union-attr]
+        event_id = outcome.get("eventId") if outcome.get("success") else None
+        if event_id:
+            verification = await self.deps.calendar_sub_agent.verify(  # type: ignore[union-attr]
+                event_id,
+                "create",
+                {"title": instruction["title"], "start": instruction["start"]},
+            )
+        else:
+            verification = {"verified": False, "actual_state": "not_created"}
+        append_journal(self.deps.journal_path, {
+            "kind": "action",
+            "goalId": goal.get("id"),
+            "messageId": card.message.get("id"),
+            "title": goal.get("title"),
+            "transport": "calendar",
+            "action": "create",
+            "eventTitle": instruction["title"],
+            "eventStart": instruction["start"],
+            "eventEnd": instruction["end"],
+            "outcomes": [outcome],
+            "verification": verification,
+            **self._replay_context(card),
+        })
+        self.queue.pop(idx)
+        self.queued_message_ids.discard(card.message.get("id", ""))
+        await self._broadcast_queue_update()
+        return web.json_response({
+            "ok": True,
+            "outcomes": [outcome],
+            "verification": verification,
+        })
+
+    async def _dispatch_calendar_decline(self, idx: int, card: CardState) -> web.Response:
+        goal = card.goal
+        event_id = goal.get("eventId", "")
+        outcome = await self.deps.calendar_sub_agent.dispatch({  # type: ignore[union-attr]
+            "capability": "decline",
+            "eventId": event_id,
+        })
+        verification = await self.deps.calendar_sub_agent.verify(  # type: ignore[union-attr]
+            event_id,
+            "decline",
+        )
+        append_journal(self.deps.journal_path, {
+            "kind": "action",
+            "goalId": goal.get("id"),
+            "messageId": card.message.get("id"),
+            "title": goal.get("title"),
+            "transport": "calendar",
+            "action": "decline",
+            "eventId": event_id,
             "outcomes": [outcome],
             "verification": verification,
             **self._replay_context(card),

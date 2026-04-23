@@ -2,6 +2,14 @@
 
 ## 2026-04-23
 
+### Slice 017 — calendar sub-agent (read / create / decline)
+- New `calendar` transport. Three actions: `read` (reversible), `create` (irreversible), `decline` (irreversible). Create + decline ride the existing halt machinery, so every write gets a re-approval card.
+- `steward/calendar/fake.py` (NEW): `FakeCalendar` backed by a JSON file (same pattern as `FakeGmail`). Events have `id`, `title`, `start`, `end`, `attendees`, `status`. `list_events` filters out `declined` / `cancelled`.
+- `steward/calendar/subagent.py` (NEW): `FakeCalendarSubAgent` with `dispatch` for all three capabilities + `verify`. Verification re-fetches the event; `create` verification optionally checks `title` and `start` match; `decline` verification checks `status == 'declined'`.
+- `steward/rules.py`: `calendar.md` loaded alongside `gmail.md` (side-effect for now; no parsed soft-rules schema yet). Watcher reloads on changes to either.
+- `steward/executor/server.py`: `calendar` transport routed through three new dispatchers. Re-approval cards now carry `eventId`, `eventTitle`, `eventStart`, `eventEnd`, `eventAttendees`, `eventDescription` through the halt so the user sees them again before committing.
+- Tests: 24 new (5 fake, 13 sub-agent, 6 e2e). Total: 250 passing. E2E covers the full halt → re-approve → dispatch → verify cycle for decline + create, the no-halt path for read, unknown-event failure journaling, and `calendar.md` loader sanity.
+
 ### Slice 016 — payments capability (fake provider; HITL pending)
 - New `payments` transport with `charge` action. Declared irreversible — rides the existing halt machinery (slice 011), so every approve goes through a re-approval card showing amount + payee + card ref before the charge fires.
 - `steward/payments/fake.py` (NEW): `FakePaymentProvider` — in-memory charge store with idempotency-key dedup and injectable issuer-failure for tests. Real Stripe Issuing adapter (or similar) is a separate slice; same `charge` / `get_charge` surface keeps the swap local.
