@@ -8,6 +8,9 @@ dependencies = [
     "anthropic>=0.40",
     "pyyaml>=6.0",
     "websockets>=13.0",
+    "google-api-python-client>=2.140",
+    "google-auth>=2.33",
+    "google-auth-oauthlib>=1.2",
 ]
 
 [project.optional-dependencies]

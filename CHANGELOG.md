@@ -2,6 +2,17 @@
 
 ## 2026-04-23
 
+### Real Gmail adapter
+- First adapter for a real external service. Swaps `FakeGmail` for `RealGmail` behind a formal `GmailProvider` protocol — `STEWARD_GMAIL=real` flips one function in `__main__.py` and nothing else.
+- `steward/gmail/provider.py` (NEW): `GmailProvider` protocol — the surface both providers satisfy (search / get_by_id / archive / create_draft / get_draft / list_drafts / send_draft).
+- `steward/gmail/real.py` (NEW): `RealGmail` backed by `google-api-python-client`. Messages translated at the boundary: Gmail label `UNREAD` drives `unread`, presence/absence of `INBOX` drives `archived`. Body currently pulled from `snippet` (full MIME-part decode deferred until a feature needs it). Drafts built as RFC-2822 with In-Reply-To + References headers for proper threading. 404s on archive/get_by_id/drafts.get bubble up as `None` / `False` instead of exceptions.
+- `steward/gmail/oauth.py` (NEW): one-off bootstrap CLI. `python -m steward.gmail.oauth bootstrap --client-id ID --client-secret SECRET` opens the browser, runs the OAuth consent flow on a localhost redirect, prints the refresh token so the user can paste it into 1Password. Scope is the minimum viable: `gmail.modify` (covers read, archive, drafts.create, drafts.send).
+- `steward/executor/__main__.py`: `STEWARD_GMAIL=real` resolves `op://vault/gmail/{client_id,client_secret,refresh_token}` at startup (refs env-configurable via `STEWARD_GMAIL_*_REF`) and constructs `RealGmail`. Exits 2 if the vault is locked, 3 if any ref fails to resolve. Default stays `FakeGmail` — no regressions for existing users.
+- `steward/gmail/subagent.py`: `GmailSubAgent` type now references `GmailProvider` (structural) rather than `FakeGmail` concretely. No behavior change.
+- Deps: `google-api-python-client`, `google-auth`, `google-auth-oauthlib`.
+- Tests: 22 new, 272 total. Coverage: message/draft translation (label-to-flag mapping, header case-insensitivity, body base64 decode, snippet fallback); RFC-2822 raw-message assembly with threading headers; credentials construction; mock-based round-trips for search (list→get chain), archive (modify removeLabelIds), get_by_id (metadata format), create_draft (threaded reply), list_drafts (per-id fetch), send_draft (sent=True after); 404 propagation for archive/get/send.
+- Not exercised in pytest: live API calls (requires real OAuth). Manual path: GCP project + OAuth client + `python -m steward.gmail.oauth bootstrap` once, then `STEWARD_GMAIL=real STEWARD_CREDENTIALS=op python -m steward.executor`.
+
 ### Slice 017 — calendar sub-agent (read / create / decline)
 - New `calendar` transport. Three actions: `read` (reversible), `create` (irreversible), `decline` (irreversible). Create + decline ride the existing halt machinery, so every write gets a re-approval card.
 - `steward/calendar/fake.py` (NEW): `FakeCalendar` backed by a JSON file (same pattern as `FakeGmail`). Events have `id`, `title`, `start`, `end`, `attendees`, `status`. `list_events` filters out `declined` / `cancelled`.

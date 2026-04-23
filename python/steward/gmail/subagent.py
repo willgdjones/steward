@@ -1,15 +1,17 @@
-"""Gmail sub-agent: dispatch + verify for archive, draft_reply, send_draft."""
+"""Gmail sub-agent: dispatch + verify for archive, draft_reply, send_draft.
+
+Takes any `GmailProvider` (FakeGmail for tests, RealGmail for production)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
-from steward.gmail.fake import FakeGmail
+from steward.gmail.provider import GmailProvider
 
 
 @dataclass
 class GmailSubAgent:
-    gmail: FakeGmail
+    gmail: GmailProvider
 
     async def dispatch(self, instruction: dict[str, Any]) -> dict[str, Any]:
         cap = instruction.get("capability")
@@ -121,5 +123,5 @@ class GmailSubAgent:
         return {"verified": False, "actual_state": "unknown", "messageId": message_id}
 
 
-def create_gmail_sub_agent(gmail: FakeGmail) -> GmailSubAgent:
+def create_gmail_sub_agent(gmail: GmailProvider) -> GmailSubAgent:
     return GmailSubAgent(gmail=gmail)
